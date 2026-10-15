@@ -1,0 +1,18 @@
+{
+  "name": "suryas-groceries-server",
+  "version": "1.0.0",
+  "description": "Surya's General Store Backend Server & API for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "nodemailer": "^6.10.0"
+  }
+}

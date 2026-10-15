@@ -1883,10 +1883,22 @@ const webBuildPath = path.join(__dirname, "../build/web");
 app.use(express.static(webBuildPath));
 
 app.use((req, res, next) => {
-  if (req.method === "GET" && !req.path.startsWith("/api") && !req.path.startsWith("/public")) {
+  if (
+    req.method === "GET" &&
+    !req.path.startsWith("/api") &&
+    !req.path.startsWith("/public")
+  ) {
     const indexFile = path.join(webBuildPath, "index.html");
-    return res.sendFile(indexFile);
+
+    if (require("fs").existsSync(indexFile)) {
+      return res.sendFile(indexFile);
+    }
+
+    return res.status(404).json({
+      error: "Frontend files are not available on this server."
+    });
   }
+
   next();
 });
 

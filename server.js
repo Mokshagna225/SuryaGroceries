@@ -143,6 +143,14 @@ CREATE TABLE IF NOT EXISTS payments (
     ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS redeemed_coupons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  email TEXT,
+  coupon_code TEXT NOT NULL,
+  used_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS
 idx_login_user_time
 ON login_events(user_id, login_time);
@@ -1219,6 +1227,19 @@ function handleCreatePaymentOrder(req, res) {
 
     console.log(`🛒 [NEW ORDER CREATED] Order ${orderId} by ${finalName} (${finalMobile}) for ₹${amount}. UTR: ${finalUtr}`);
 
+    if (req.body.couponApplied || req.body.couponCode) {
+      try {
+        db.prepare(
+          "INSERT INTO redeemed_coupons (user_id, email, coupon_code, used_at) VALUES (?, ?, ?, ?)"
+        ).run(
+          req.user.id,
+          finalEmail,
+          req.body.couponCode || "SURYA50",
+          paymentTime
+        );
+      } catch (_) {}
+    }
+
     res.status(201).json({
       success: true,
       orderId,
@@ -1235,6 +1256,48 @@ function handleCreatePaymentOrder(req, res) {
 
 app.post("/api/payments", firebaseAuth, syncUser, handleCreatePaymentOrder);
 app.post("/api/orders", firebaseAuth, syncUser, handleCreatePaymentOrder);
+
+app.post("/api/coupons/validate", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const rawCode = String(req.body.code || "").trim().toUpperCase();
+    const validCodes = ["SURYA50", "FIRST50", "WELCOME50", "SURYA"];
+    if (!validCodes.includes(rawCode)) {
+      return res.status(400).json({
+        valid: false,
+        message: `Invalid promo code '${rawCode}'. Use SURYA50 on your first order!`,
+      });
+    }
+
+    const pastOrders = db
+      .prepare("SELECT COUNT(*) as count FROM payments WHERE user_id = ?")
+      .get(req.user.id);
+    const pastCoupons = db
+      .prepare(
+        "SELECT COUNT(*) as count FROM redeemed_coupons WHERE user_id = ? OR email = ?"
+      )
+      .get(req.user.id, req.user.email || "");
+
+    if (
+      (pastOrders && pastOrders.count > 0) ||
+      (pastCoupons && pastCoupons.count > 0)
+    ) {
+      return res.status(400).json({
+        valid: false,
+        message:
+          "Coupon already redeemed. This discount is valid ONLY on your first grocery order.",
+      });
+    }
+
+    res.json({
+      valid: true,
+      discount: 50,
+      code: rawCode,
+      message: "First-order coupon applied! Flat ₹50 discount added.",
+    });
+  } catch (error) {
+    res.status(500).json({ valid: false, message: "Could not validate coupon." });
+  }
+});
 
 // ============================================================
 // USER ORDERS

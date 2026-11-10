@@ -4,3 +4,7 @@ node_modules/
 *.db-shm
 *.db-wal
 serviceAccountKey.json
+
+.env*
+*.pem
+*.key

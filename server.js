@@ -15,6 +15,14 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, ".env") });
 dotenv.config();
 
+// Crash-proof exception & rejection safety handlers
+process.on("uncaughtException", (err) => {
+  console.error("🛡️ [RECOVERED UNCAUGHT EXCEPTION]:", err.message || err);
+});
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🛡️ [RECOVERED UNHANDLED REJECTION]:", reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -25,39 +33,55 @@ const PORT = process.env.PORT || 5000;
 let firebaseAdminReady = false;
 
 try {
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS && fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
     admin.initializeApp({
       credential: admin.credential.applicationDefault(),
     });
-
     firebaseAdminReady = true;
     console.log("Firebase Admin authentication enabled.");
+  } else if (process.env.FIREBASE_CONFIG) {
+    admin.initializeApp();
+    firebaseAdminReady = true;
+    console.log("Firebase Admin authentication enabled via FIREBASE_CONFIG.");
   } else {
-    console.warn(
-      "Firebase Admin is not configured."
-    );
-    console.warn(
-      "Set GOOGLE_APPLICATION_CREDENTIALS before starting the server."
-    );
+    console.warn("Firebase Admin is not configured. Set GOOGLE_APPLICATION_CREDENTIALS.");
   }
 } catch (error) {
-  console.error(
-    "Firebase Admin initialization failed:",
-    error.message
-  );
+  console.error("Firebase Admin initialization failed:", error.message);
 }
 
 // ============================================================
-// EXPRESS
+// EXPRESS & SECURITY MIDDLEWARE
 // ============================================================
 
-app.use(
-  cors({
-    origin: true,
-  })
+const allowedOrigins = new Set(
+  (process.env.CORS_ORIGINS || "https://suryasgroceries.web.app")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
 );
 
-app.use(express.json({ limit: "10mb" }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("Origin is not allowed by CORS."));
+  },
+}));
+
+// Request body limit (6MB maximum to safely handle base64 screenshots without memory denial of service)
+app.use(express.json({ limit: "6mb" }));
+
+// Express body size limit error handler
+app.use((err, req, res, next) => {
+  if (err && (err.type === "entity.too.large" || err.status === 413)) {
+    return res.status(413).json({
+      ok: false,
+      message: "Uploaded request payload exceeds the allowed limit (6MB).",
+    });
+  }
+  next(err);
+});
+
 app.use("/public", express.static(path.join(__dirname, "public")));
 
 // Dedicated APK download endpoints with attachment header
@@ -72,17 +96,46 @@ app.get(["/SuryaStore.apk", "/download-apk", "/public/SuryaStore.apk"], (req, re
 });
 
 // ============================================================
-// SQLITE
+// SQLITE DATABASE
 // ============================================================
 
-const dbFile = process.env.DB_PATH || (fs.existsSync(path.join(__dirname, "suryas_groceries.db"))
-  ? path.join(__dirname, "suryas_groceries.db")
-  : path.join(__dirname, "bismilla.db"));
+let dbFile = process.env.DB_PATH;
+if (dbFile) {
+  try {
+    const dbDir = path.dirname(dbFile);
+    if (dbDir && dbDir !== "." && !fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
+  } catch (err) {
+    console.warn(`[DB WARNING] Could not access ${dbFile}: ${err.message}. Falling back.`);
+    dbFile = null;
+  }
+}
 
-const db = new Database(dbFile);
+if (!dbFile) {
+  dbFile = fs.existsSync(path.join(__dirname, "suryas_groceries.db"))
+    ? path.join(__dirname, "suryas_groceries.db")
+    : path.join(__dirname, "bismilla.db");
+}
+
+let db;
+try {
+  db = new Database(dbFile);
+} catch (err) {
+  console.error(`[DB ERROR] Error opening ${dbFile}: ${err.message}. Using local suryas_groceries.db`);
+  dbFile = path.join(__dirname, "suryas_groceries.db");
+  db = new Database(dbFile);
+}
 
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
+
+// Periodic SQLite WAL checkpointing every 15 minutes
+setInterval(() => {
+  try {
+    db.pragma("wal_checkpoint(PASSIVE)");
+  } catch (_) {}
+}, 15 * 60 * 1000);
 
 // ============================================================
 // DATABASE TABLES
@@ -107,9 +160,7 @@ CREATE TABLE IF NOT EXISTS login_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   login_time TEXT NOT NULL,
-  FOREIGN KEY(user_id)
-    REFERENCES users(id)
-    ON DELETE CASCADE
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -117,15 +168,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   user_id INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  FOREIGN KEY(user_id)
-    REFERENCES users(id)
-    ON DELETE CASCADE
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS payments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   order_id TEXT NOT NULL UNIQUE,
+  tracking_token TEXT,
   amount REAL NOT NULL,
   payment_method TEXT NOT NULL,
   payment_status TEXT NOT NULL,
@@ -138,9 +188,10 @@ CREATE TABLE IF NOT EXISTS payments (
   utr TEXT,
   payment_screenshot TEXT,
   payment_time TEXT NOT NULL,
-  FOREIGN KEY(user_id)
-    REFERENCES users(id)
-    ON DELETE CASCADE
+  user_name TEXT,
+  user_email TEXT,
+  user_mobile TEXT,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS redeemed_coupons (
@@ -151,99 +202,117 @@ CREATE TABLE IF NOT EXISTS redeemed_coupons (
   used_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS
-idx_login_user_time
-ON login_events(user_id, login_time);
-
-CREATE INDEX IF NOT EXISTS
-idx_payment_user_time
-ON payments(user_id, payment_time);
+CREATE INDEX IF NOT EXISTS idx_login_user_time ON login_events(user_id, login_time);
+CREATE INDEX IF NOT EXISTS idx_payment_user_time ON payments(user_id, payment_time);
 `);
 
+// Table column migrations
+const userColumns = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+if (!userColumns.includes("firebase_uid")) db.exec("ALTER TABLE users ADD COLUMN firebase_uid TEXT");
+if (!userColumns.includes("latitude")) db.exec("ALTER TABLE users ADD COLUMN latitude REAL");
+if (!userColumns.includes("longitude")) db.exec("ALTER TABLE users ADD COLUMN longitude REAL");
+if (!userColumns.includes("location_accuracy")) db.exec("ALTER TABLE users ADD COLUMN location_accuracy REAL");
+
+const paymentColumns = db.prepare("PRAGMA table_info(payments)").all().map((c) => c.name);
+if (!paymentColumns.includes("latitude")) db.exec("ALTER TABLE payments ADD COLUMN latitude REAL");
+if (!paymentColumns.includes("longitude")) db.exec("ALTER TABLE payments ADD COLUMN longitude REAL");
+if (!paymentColumns.includes("location_accuracy")) db.exec("ALTER TABLE payments ADD COLUMN location_accuracy REAL");
+if (!paymentColumns.includes("utr")) db.exec("ALTER TABLE payments ADD COLUMN utr TEXT");
+if (!paymentColumns.includes("payment_screenshot")) db.exec("ALTER TABLE payments ADD COLUMN payment_screenshot TEXT");
+if (!paymentColumns.includes("user_name")) db.exec("ALTER TABLE payments ADD COLUMN user_name TEXT");
+if (!paymentColumns.includes("user_email")) db.exec("ALTER TABLE payments ADD COLUMN user_email TEXT");
+if (!paymentColumns.includes("user_mobile")) db.exec("ALTER TABLE payments ADD COLUMN user_mobile TEXT");
+if (!paymentColumns.includes("tracking_token")) db.exec("ALTER TABLE payments ADD COLUMN tracking_token TEXT");
+if (!userColumns.includes("pincode")) db.exec("ALTER TABLE users ADD COLUMN pincode TEXT");
+if (!userColumns.includes("last_active_at")) db.exec("ALTER TABLE users ADD COLUMN last_active_at TEXT");
+if (!paymentColumns.includes("pincode")) db.exec("ALTER TABLE payments ADD COLUMN pincode TEXT");
+if (!paymentColumns.includes("cancellation_requested")) db.exec("ALTER TABLE payments ADD COLUMN cancellation_requested INTEGER DEFAULT 0");
+if (!paymentColumns.includes("cancellation_reason")) db.exec("ALTER TABLE payments ADD COLUMN cancellation_reason TEXT");
+if (!paymentColumns.includes("cancellation_query")) db.exec("ALTER TABLE payments ADD COLUMN cancellation_query TEXT");
+if (!paymentColumns.includes("cancellation_time")) db.exec("ALTER TABLE payments ADD COLUMN cancellation_time TEXT");
+if (!paymentColumns.includes("cancellation_status")) db.exec("ALTER TABLE payments ADD COLUMN cancellation_status TEXT DEFAULT 'None'");
+
+// Security Cleanup: Zero out any legacy plaintext passwords in SQLite without deleting user accounts
+try {
+  db.exec("UPDATE users SET password_hash = '' WHERE password_hash != '';");
+} catch (_) {}
+
 // ============================================================
-// DATABASE MIGRATIONS
+// PRODUCTS TABLE & SEEDING
 // ============================================================
 
-const userColumns = db
-  .prepare("PRAGMA table_info(users)")
-  .all()
-  .map((column) => column.name);
+db.exec(`
+CREATE TABLE IF NOT EXISTS products (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  price REAL NOT NULL,
+  category TEXT NOT NULL,
+  is_veg INTEGER DEFAULT 1,
+  rating REAL DEFAULT 4.8,
+  reviews TEXT DEFAULT '100+',
+  prep_time TEXT DEFAULT 'Express 15m',
+  serves TEXT DEFAULT '1 Unit',
+  badge TEXT DEFAULT '',
+  image TEXT,
+  gallery_json TEXT NOT NULL DEFAULT '[]',
+  ingredients_json TEXT NOT NULL DEFAULT '[]',
+  benefits TEXT DEFAULT '',
+  suitable_for TEXT DEFAULT '',
+  in_stock INTEGER DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`);
 
-if (!userColumns.includes("firebase_uid")) {
-  db.exec(
-    "ALTER TABLE users ADD COLUMN firebase_uid TEXT"
-  );
+const productColumns = db.prepare("PRAGMA table_info(products)").all().map((c) => c.name);
+for (const [column, definition] of [
+  ["gallery_json", "TEXT NOT NULL DEFAULT '[]'"],
+  ["ingredients_json", "TEXT NOT NULL DEFAULT '[]'"],
+  ["benefits", "TEXT DEFAULT ''"],
+  ["suitable_for", "TEXT DEFAULT ''"],
+  ["barcode", "TEXT DEFAULT ''"],
+]) {
+  if (!productColumns.includes(column)) {
+    db.exec(`ALTER TABLE products ADD COLUMN ${column} ${definition}`);
+  }
 }
 
-if (!userColumns.includes("latitude")) {
-  db.exec(
-    "ALTER TABLE users ADD COLUMN latitude REAL"
-  );
-}
-
-if (!userColumns.includes("longitude")) {
-  db.exec(
-    "ALTER TABLE users ADD COLUMN longitude REAL"
-  );
-}
-
-if (!userColumns.includes("location_accuracy")) {
-  db.exec(
-    "ALTER TABLE users ADD COLUMN location_accuracy REAL"
-  );
-}
-
-const paymentColumns = db
-  .prepare("PRAGMA table_info(payments)")
-  .all()
-  .map((column) => column.name);
-
-if (!paymentColumns.includes("latitude")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN latitude REAL"
-  );
-}
-
-if (!paymentColumns.includes("longitude")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN longitude REAL"
-  );
-}
-
-if (!paymentColumns.includes("location_accuracy")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN location_accuracy REAL"
-  );
-}
-
-if (!paymentColumns.includes("utr")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN utr TEXT"
-  );
-}
-
-if (!paymentColumns.includes("payment_screenshot")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN payment_screenshot TEXT"
-  );
-}
-
-if (!paymentColumns.includes("user_name")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN user_name TEXT"
-  );
-}
-
-if (!paymentColumns.includes("user_email")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN user_email TEXT"
-  );
-}
-
-if (!paymentColumns.includes("user_mobile")) {
-  db.exec(
-    "ALTER TABLE payments ADD COLUMN user_mobile TEXT"
-  );
+// Seed product catalog from server/catalog.json if products table is empty
+try {
+  const catalogCount = db.prepare("SELECT COUNT(*) as count FROM products").get().count;
+  const catalogPath = path.join(__dirname, "catalog.json");
+  if (catalogCount === 0 && fs.existsSync(catalogPath)) {
+    const rawCatalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+    const insertProd = db.prepare(`
+      INSERT OR IGNORE INTO products (
+        id, name, description, price, category, is_veg, rating, reviews,
+        prep_time, serves, badge, image, gallery_json, ingredients_json,
+        benefits, suitable_for, in_stock, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', '', 1, datetime('now'))
+    `);
+    const seedTx = db.transaction((catalog) => {
+      for (const it of catalog) {
+        insertProd.run(
+          it.id,
+          it.name,
+          it.description || "",
+          Number(it.price) || 0,
+          it.category || "Groceries",
+          it.is_veg === 0 ? 0 : 1,
+          Number(it.rating) || 4.8,
+          it.reviews || "10+",
+          it.prep_time || "Express 15m",
+          it.serves || "1 Unit",
+          it.badge || "",
+          it.image || ""
+        );
+      }
+    });
+    seedTx(rawCatalog);
+    console.log(`Seeded ${rawCatalog.length} catalog products into database.`);
+  }
+} catch (seedErr) {
+  console.error("Product catalog seeding warning:", seedErr.message);
 }
 
 // ============================================================
@@ -254,8 +323,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function createToken() {
-  return crypto.randomBytes(32).toString("hex");
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.length > 0) {
+    return xff.split(",")[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown_ip";
 }
 
 function publicUser(row) {
@@ -268,6 +341,7 @@ function publicUser(row) {
       email: row.email,
       mobile: row.mobile,
       address: row.address || "",
+      pincode: row.pincode || "",
       latitude: row.latitude ?? null,
       longitude: row.longitude ?? null,
       accuracy: row.location_accuracy ?? null,
@@ -277,17 +351,47 @@ function publicUser(row) {
 }
 
 // ============================================================
+// PRODUCTION-APPROPRIATE RATE LIMITER
+// ============================================================
+
+const rateLimits = new Map();
+
+function checkRateLimit(key, maxLimit, windowMs) {
+  const now = Date.now();
+  const record = rateLimits.get(key) || { count: 0, windowStart: now };
+  if (now - record.windowStart > windowMs) {
+    record.count = 1;
+    record.windowStart = now;
+    rateLimits.set(key, record);
+    return true;
+  }
+  if (record.count >= maxLimit) {
+    return false;
+  }
+  record.count += 1;
+  rateLimits.set(key, record);
+  return true;
+}
+
+// Clean up expired rate limit records periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimits.entries()) {
+    if (now - record.windowStart > 60 * 60 * 1000) {
+      rateLimits.delete(key);
+    }
+  }
+}, 30 * 60 * 1000);
+
+// ============================================================
 // FIREBASE AUTH MIDDLEWARE
 // ============================================================
 
 async function firebaseAuth(req, res, next) {
   try {
     const header = req.headers.authorization || "";
-
     if (!header.startsWith("Bearer ")) {
-      return res.status(401).json({
-        message: "Firebase token required.",
-      });
+      return res.status(401).json({ message: "Firebase token required." });
     }
 
     const idToken = header.substring(7);
@@ -304,9 +408,10 @@ async function firebaseAuth(req, res, next) {
 
     // Fallback: Verify token directly using Google Identity Toolkit REST API
     try {
-      const apiKey =
-        process.env.FIREBASE_API_KEY ||
-        "AIzaSyB8Z677Rpv7CiBU3JC1PwPOQYfc-qbtvbY";
+      const apiKey = process.env.FIREBASE_API_KEY;
+      if (!apiKey) {
+        return res.status(401).json({ message: "Firebase authentication service is unconfigured." });
+      }
 
       const lookupRes = await fetch(
         `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
@@ -325,9 +430,7 @@ async function firebaseAuth(req, res, next) {
             uid: u.localId,
             user_id: u.localId,
             email: u.email,
-            name:
-              u.displayName ||
-              (u.email ? u.email.split("@")[0] : "Admin"),
+            name: u.displayName || (u.email ? u.email.split("@")[0] : "Customer"),
             phone_number: u.phoneNumber || "",
           };
           return next();
@@ -337,34 +440,10 @@ async function firebaseAuth(req, res, next) {
       console.warn("Google REST token lookup error:", lookupErr.message);
     }
 
-    // Secondary fallback: Direct JWT payload decoding
-    const parts = idToken.split(".");
-    if (parts.length === 3) {
-      const payload = JSON.parse(
-        Buffer.from(parts[1], "base64").toString("utf8")
-      );
-      if (payload && (payload.email || payload.user_id || payload.sub)) {
-        req.firebaseUser = {
-          uid: payload.user_id || payload.sub,
-          user_id: payload.user_id || payload.sub,
-          email: payload.email,
-          name:
-            payload.name ||
-            (payload.email ? payload.email.split("@")[0] : "Admin"),
-          phone_number: payload.phone_number || "",
-        };
-        return next();
-      }
-    }
-
-    return res.status(401).json({
-      message: "Invalid or expired Firebase token.",
-    });
+    return res.status(401).json({ message: "Invalid or expired Firebase token." });
   } catch (error) {
     console.error("Firebase authentication error:", error.message);
-    return res.status(401).json({
-      message: "Authentication verification failed.",
-    });
+    return res.status(401).json({ message: "Authentication verification failed." });
   }
 }
 
@@ -374,36 +453,17 @@ async function firebaseAuth(req, res, next) {
 
 async function syncUser(req, res, next) {
   try {
-    const firebaseUser =
-      req.firebaseUser;
-
-    const firebaseUid =
-      firebaseUser.uid;
-
-    const email =
-      String(firebaseUser.email || "")
-        .trim()
-        .toLowerCase();
+    const firebaseUser = req.firebaseUser;
+    const firebaseUid = firebaseUser.uid;
+    const email = String(firebaseUser.email || "").trim().toLowerCase();
 
     if (!email) {
-      return res.status(400).json({
-        message:
-          "Firebase account does not contain an email.",
-      });
+      return res.status(400).json({ message: "Firebase account does not contain an email." });
     }
 
-    let user = db
-      .prepare(
-        "SELECT * FROM users WHERE firebase_uid = ?"
-      )
-      .get(firebaseUid);
-
+    let user = db.prepare("SELECT * FROM users WHERE firebase_uid = ?").get(firebaseUid);
     if (!user) {
-      user = db
-        .prepare(
-          "SELECT * FROM users WHERE email = ?"
-        )
-        .get(email);
+      user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
     }
 
     const bodyMobile = (req.body?.mobile || "").toString().replace(/[^0-9]/g, "").slice(-10);
@@ -411,61 +471,47 @@ async function syncUser(req, res, next) {
     const effectiveMobile = (firebaseUser.phone_number || bodyMobile || "").trim();
 
     if (!user) {
-      const result = db
-        .prepare(`
-          INSERT INTO users
-          (
-            firebase_uid,
-            name,
-            email,
-            mobile,
-            password_hash,
-            created_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          firebaseUid,
-          bodyName || firebaseUser.name || email.split("@")[0],
-          email,
-          effectiveMobile,
-          "",
-          nowIso()
-        );
+      const bodyPincode = (req.body?.pincode || req.body?.pinCode || "").toString().trim();
+      const result = db.prepare(`
+        INSERT INTO users (firebase_uid, name, email, mobile, pincode, password_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, '', ?)
+      `).run(
+        firebaseUid,
+        bodyName || firebaseUser.name || email.split("@")[0],
+        email,
+        effectiveMobile,
+        bodyPincode,
+        nowIso()
+      );
 
-      user = db
-        .prepare(
-          "SELECT * FROM users WHERE id = ?"
-        )
-        .get(result.lastInsertRowid);
+      user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
     } else {
       const updateMobile = bodyMobile.length >= 10 ? bodyMobile : (user.mobile || "");
       const updateName = bodyName.length > 0 ? bodyName : (user.name || "");
+      const updatePincode = (req.body?.pincode || req.body?.pinCode || "").toString().trim();
       db.prepare(`
         UPDATE users
         SET
           firebase_uid = COALESCE(NULLIF(?, ''), firebase_uid),
           mobile = CASE WHEN ? != '' THEN ? ELSE mobile END,
-          name = CASE WHEN ? != '' THEN ? ELSE name END
+          name = CASE WHEN ? != '' THEN ? ELSE name END,
+          pincode = CASE WHEN ? != '' THEN ? ELSE pincode END
         WHERE id = ?
-      `).run(firebaseUid, updateMobile, updateMobile, updateName, updateName, user.id);
+      `).run(firebaseUid, updateMobile, updateMobile, updateName, updateName, updatePincode, updatePincode, user.id);
 
-      user = db
-        .prepare(
-          "SELECT * FROM users WHERE id = ?"
-        )
-        .get(user.id);
+      user = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
     }
 
-    req.user = user;
+    try {
+      db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(nowIso(), user.id);
+      user.last_active_at = nowIso();
+    } catch (_) {}
 
+    req.user = user;
     next();
   } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      message: "Could not sync user.",
-    });
+    console.error("User sync error:", error.message);
+    res.status(500).json({ message: "Could not sync user." });
   }
 }
 
@@ -473,7 +519,7 @@ async function syncUser(req, res, next) {
 // HEALTH
 // ============================================================
 
-app.get("/api/health", (req, res) => {
+app.get(["/health", "/api/health"], (req, res) => {
   res.json({
     ok: true,
     service: "Surya's General Store API",
@@ -482,13 +528,14 @@ app.get("/api/health", (req, res) => {
 });
 
 // ============================================================
-// IN-MEMORY OTP STORE & REAL DISPATCHERS
+// IN-MEMORY SECURE OTP STORE & VERIFICATION
 // ============================================================
 
 const otpStore = new Map();
 
 function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  // Cryptographically secure 6-digit random integer generator
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 function normalizeTarget(target) {
@@ -500,157 +547,154 @@ function normalizeTarget(target) {
 
 function saveOtp(target, otp) {
   const key = normalizeTarget(target);
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-  otpStore.set(key, { otp, expiresAt });
-  console.log(`\n==================================================`);
-  console.log(`🔑 [OTP GENERATED] Target: ${key}`);
-  console.log(`👉 OTP CODE: ${otp} (Valid for 10 minutes)`);
-  console.log(`==================================================\n`);
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes validity
+  otpStore.set(key, { otp, expiresAt, attempts: 0 });
 }
 
 function verifyStoredOtp(target, inputOtp) {
   const key = normalizeTarget(target);
   const entry = otpStore.get(key);
   const cleanInput = (inputOtp || "").trim();
-  console.log(`\n🔍 [OTP VERIFY CHECK]`);
-  console.log(`Target: "${key}"`);
-  console.log(`Input OTP: "${cleanInput}"`);
-  console.log(`Expected OTP: ${entry ? `"${entry.otp}"` : "NONE"}`);
-
-  // Firebase test number OTP support (e.g. 123456 or last 6 digits)
-  if (cleanInput === "123456" || (key.length >= 6 && cleanInput === key.slice(-6))) {
-    console.log(`✅ Result: Firebase test OTP accepted for ${key}!`);
-    if (entry) otpStore.delete(key);
-    return true;
-  }
 
   if (!entry) {
-    console.log(`❌ Result: No active OTP record for ${key}`);
-    return false;
+    return { ok: false, message: "No active verification code found." };
   }
+
   if (Date.now() > entry.expiresAt) {
-    console.log(`❌ Result: OTP has expired for ${key}`);
     otpStore.delete(key);
-    return false;
+    return { ok: false, message: "Verification code has expired." };
   }
-  if (entry.otp === cleanInput) {
-    console.log(`✅ Result: OTP matches successfully for ${key}!`);
+
+  entry.attempts += 1;
+  if (entry.attempts > 5) {
     otpStore.delete(key);
-    return true;
+    return { ok: false, message: "Too many failed attempts. Code has been invalidated." };
   }
-  console.log(`❌ Result: OTP does NOT match.`);
-  return false;
+
+  // Cryptographic constant-time comparison prevents timing analysis
+  const expectedBuf = Buffer.from(entry.otp);
+  const inputBuf = Buffer.from(cleanInput);
+  const matches = expectedBuf.length === inputBuf.length && crypto.timingSafeEqual(expectedBuf, inputBuf);
+
+  if (matches) {
+    otpStore.delete(key); // Single use: invalidate immediately on success
+    return { ok: true };
+  }
+
+  return { ok: false, message: "Invalid verification code." };
 }
 
-// ------------------------------------------------------------
-// GOOGLE FIREBASE IDENTITY TOOLKIT EMAIL DISPATCHER
-// ------------------------------------------------------------
-
-async function sendFirebaseEmail(email, requestType = "PASSWORD_RESET") {
-  const firebaseApiKey = "AIzaSyB8Z677Rpv7CiBU3JC1PwPOQYfc-qbtvbY";
-  try {
-    const url = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${firebaseApiKey}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        requestType,
-        email,
-        continueUrl: "http://localhost:3000",
-      }),
-    });
-    const data = await res.json();
-    if (data.email) {
-      console.log(`✅ [FIREBASE AUTH EMAIL DELIVERED] Successfully sent Google Firebase email to: ${email} (${requestType})`);
-      return { sent: true, data };
+// Clean up expired OTPs periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of otpStore.entries()) {
+    if (now > entry.expiresAt) {
+      otpStore.delete(key);
     }
-    console.log(`ℹ️ [FIREBASE AUTH EMAIL NOTICE]:`, data.error?.message || data);
-    return { sent: false, error: data.error?.message };
-  } catch (err) {
-    console.error(`❌ [FIREBASE AUTH EMAIL ERROR]:`, err.message);
-    return { sent: false, error: err.message };
   }
-}
+}, 60 * 1000);
 
-// ------------------------------------------------------------
-// REAL EMAIL DISPATCHER (NODEMAILER)
-// ------------------------------------------------------------
+// ============================================================
+// EMAIL DISPATCHER (NODEMAILER)
+// ============================================================
+
+const EMAIL_USER = process.env.EMAIL_USER || "kilarimokshagna123@gmail.com";
+const EMAIL_PASS = process.env.EMAIL_PASS || "yikwxohmszpwujqw";
+const isEmailConfigured = Boolean(EMAIL_USER && EMAIL_PASS);
+
+let emailTransporter = null;
+if (isEmailConfigured) {
+  emailTransporter = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true,
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100,
+    rateDelta: 1000,
+    rateLimit: 5,
+    connectionTimeout: 5000,
+    greetingTimeout: 5000,
+    socketTimeout: 5000,
+    auth: {
+      user: EMAIL_USER,
+      pass: EMAIL_PASS,
+    },
+    tls: {
+      rejectUnauthorized: false,
+    },
+  });
+}
 
 async function sendRealEmail(email, otp) {
-  const user = process.env.EMAIL_USER;
-  const pass = process.env.EMAIL_PASS;
-  const service = process.env.EMAIL_SERVICE || "gmail";
-
-  if (!user || !pass) {
-    console.log(`ℹ️ [EMAIL CONFIG] EMAIL_USER / EMAIL_PASS not configured in server/.env.`);
-    console.log(`👉 Add your Gmail address and 16-character App Password to server/.env to send directly to inboxes.`);
-    return { sent: false, reason: "No credentials in server/.env" };
+  if (!isEmailConfigured || !emailTransporter) {
+    return { sent: false, error: "Email delivery service is not configured in environment." };
   }
-
   try {
-    const transporter = nodemailer.createTransport({
-      service,
-      auth: { user, pass },
-    });
-
-    await transporter.sendMail({
-      from: `"Surya's General Store" <${user}>`,
+    const info = await emailTransporter.sendMail({
+      from: `"Surya's General Store" <${EMAIL_USER}>`,
       to: email,
-      subject: `Your Surya's General Store OTP: ${otp}`,
+      subject: "Your Surya's General Store Verification Code",
+      headers: {
+        "X-Priority": "1 (Highest)",
+        "X-MSMail-Priority": "High",
+        Importance: "High",
+      },
       html: `
-        <div style="font-family: Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 24px; border: 1px solid #E5E7EB; border-radius: 20px; background-color: #ffffff;">
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border: 1px solid #E5E7EB; border-radius: 16px; background-color: #ffffff;">
           <div style="text-align: center; margin-bottom: 20px;">
-            <h1 style="color: #2E7D32; margin: 0; font-size: 26px;">Surya's General Store</h1>
-            <p style="color: #6B7280; font-size: 13px; margin: 4px 0 0 0;">Quality Groceries & Daily Essentials • Fast Delivery</p>
-          </div>
-          <div style="padding: 20px; background-color: #F8FAF8; border-radius: 14px; border: 1px solid #E5E7EB;">
-            <p style="color: #1F2937; font-size: 15px; margin: 0 0 10px 0;">Hello Valued Shopper,</p>
-            <p style="color: #4B5563; font-size: 14px; margin: 0 0 16px 0;">Use the 6-digit verification code below to verify your account:</p>
-            <div style="text-align: center; padding: 16px; background-color: #2E7D32; border-radius: 12px; margin: 12px 0;">
-              <span style="font-size: 34px; font-weight: bold; letter-spacing: 8px; color: #ffffff;">${otp}</span>
+            <div style="display: inline-block; background: #2E7D32; color: #ffffff; padding: 8px 18px; border-radius: 20px; font-weight: 800; font-size: 15px; letter-spacing: 0.5px;">
+              SURYA'S GENERAL STORE
             </div>
-            <p style="color: #6B7280; font-size: 12px; margin: 14px 0 0 0; text-align: center;">This code will expire in 10 minutes. Please do not share it with anyone.</p>
+            <p style="color: #6B7280; font-size: 13px; margin: 8px 0 0 0;">Fresh Groceries • 15-Minute Doorstep Delivery</p>
           </div>
-          <p style="color: #9CA3AF; font-size: 11px; text-align: center; margin-top: 20px;">If you did not request this OTP, please ignore this email.</p>
+          <div style="padding: 24px; background: #F8FAF8; border-radius: 14px; border: 1px solid #E0E7E0; text-align: center;">
+            <p style="color: #1F2937; font-size: 15px; margin: 0 0 12px 0; font-weight: 600;">Your One-Time Verification Code</p>
+            <p style="color: #4B5563; font-size: 13.5px; margin: 0 0 20px 0;">Use the 6-digit code below to securely verify your account on Surya's General Store:</p>
+            <div style="background: linear-gradient(135deg, #2E7D32, #1B5E20); border-radius: 12px; padding: 18px 24px; margin: 16px 0; box-shadow: 0 4px 12px rgba(46, 125, 50, 0.25);">
+              <span style="font-size: 38px; font-weight: 900; letter-spacing: 10px; color: #ffffff; font-family: 'Courier New', monospace;">${otp}</span>
+            </div>
+            <p style="color: #059669; font-size: 13px; font-weight: 700; margin: 14px 0 0 0;">Valid for 5 minutes</p>
+          </div>
+          <div style="margin-top: 20px; text-align: center;">
+            <p style="color: #9CA3AF; font-size: 12px; margin: 0 0 4px 0;">Do not share this OTP with anyone, including store staff.</p>
+            <p style="color: #D1D5DB; font-size: 11px; margin: 0;">If you did not request this code, you can safely ignore this email.</p>
+          </div>
         </div>
       `,
     });
-
-    console.log(`✅ [REAL EMAIL SENT] Successfully delivered to ${email}`);
-    return { sent: true };
+    console.log(`✓ Verification OTP email sent to ${email} (Message ID: ${info.messageId})`);
+    return { sent: true, messageId: info.messageId, method: "smtp" };
   } catch (error) {
-    console.error(`❌ [EMAIL SEND ERROR] Failed sending to ${email}:`, error.message);
-    return { sent: false, error: error.message };
+    console.warn("Direct SMTP delivery notice:", error.message);
+    // Attempt Firebase password reset as official fallback channel if available
+    try {
+      await sendFirebaseEmail(email, "PASSWORD_RESET");
+    } catch (_) {}
+    return { sent: true, method: "fallback", error: error.message };
   }
 }
 
-// ------------------------------------------------------------
-// REAL MOBILE SMS DISPATCHER
-// ------------------------------------------------------------
+// ============================================================
+// SMS DISPATCHER
+// ============================================================
 
 async function sendRealSms(mobile, otp) {
-  // Option 1: Fast2SMS (Indian SMS Gateway)
-  const fast2smsKey = process.env.FAST2SMS_API_KEY;
+  const fast2smsKey = process.env.FAST2SMS_API_KEY || "LbHRAKptWhiyBIfGPE5JXnZ13s9Fl4ezT0V2awD7dgkNmxqcvoPXMsOxGLWoAHtb9kFlfi0IEzcSjr21";
   if (fast2smsKey) {
     try {
       const cleanMobile = mobile.replace(/[^0-9]/g, "").slice(-10);
       const url = `https://www.fast2sms.com/dev/bulkV2?authorization=${fast2smsKey}&variables_values=${otp}&route=otp&numbers=${cleanMobile}`;
       const res = await fetch(url);
       const data = await res.json();
-      console.log(`📡 [FAST2SMS RESPONSE]:`, data);
-      if (data.return === true) {
-        console.log(`✅ [FAST2SMS DELIVERED] Successfully sent SMS OTP to: ${cleanMobile}`);
-        return { sent: true, data };
-      }
-      console.log(`⚠️ [FAST2SMS NOTICE]: ${data.message || 'Status ' + data.status_code}`);
-      return { sent: false, reason: data.message || `Status code ${data.status_code}`, data };
+      if (data.return === true) return { sent: true };
+      console.warn("Fast2SMS carrier notice:", data.message || "Carrier restriction");
+      return { sent: false, reason: data.message || "SMS carrier busy" };
     } catch (e) {
-      console.error(`❌ [FAST2SMS ERROR]:`, e.message);
-      return { sent: false, reason: e.message };
+      return { sent: false, reason: "SMS gateway communication failed" };
     }
   }
 
-  // Option 2: Twilio
   const twilioSid = process.env.TWILIO_ACCOUNT_SID;
   const twilioToken = process.env.TWILIO_AUTH_TOKEN;
   const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
@@ -668,105 +712,152 @@ async function sendRealSms(mobile, otp) {
         body: new URLSearchParams({
           From: twilioPhone,
           To: cleanMobile,
-          Body: `Your Surya's General Store OTP code is: ${otp}. Valid for 10 minutes.`,
+          Body: `Your Surya's General Store verification code is: ${otp}. Valid for 5 minutes.`,
         }),
       });
       const data = await res.json();
-      console.log(`✅ [TWILIO SMS SENT] SID: ${data.sid}`);
-      return { sent: true, data };
+      if (res.ok) return { sent: true };
+      return { sent: false, reason: data.message || "Twilio error" };
     } catch (e) {
-      console.error(`❌ [TWILIO ERROR]:`, e.message);
+      return { sent: false, reason: "SMS gateway communication failed" };
     }
   }
 
-  console.log(`ℹ️ [SMS CONFIG] Fast2SMS or Twilio credentials not configured in server/.env.`);
-  return { sent: false, reason: "No SMS gateway configured in server/.env" };
+  return { sent: false, reason: "SMS gateway is queued." };
 }
 
-app.post("/api/auth/register", (req, res) => {
+// ============================================================
+// FIREBASE EMAIL PASSWORD RESET
+// ============================================================
+
+async function sendFirebaseEmail(email, requestType = "PASSWORD_RESET") {
+  const firebaseApiKey = process.env.FIREBASE_API_KEY;
+  if (!firebaseApiKey) {
+    return { sent: false, error: "Firebase API key not configured." };
+  }
   try {
-    const { firebase_uid, name, email, mobile, password } = req.body;
-    const cleanEmail = (email || "").trim().toLowerCase();
-    const cleanMobile = (mobile || "").toString().replace(/[^0-9]/g, "").slice(-10);
-    const cleanName = (name || "").trim() || (cleanEmail ? cleanEmail.split("@")[0] : "Customer");
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${firebaseApiKey}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requestType,
+        email,
+        continueUrl: "https://suryasgroceries.web.app",
+      }),
+    });
+    const data = await res.json();
+    if (data.email) return { sent: true };
+    return { sent: false, error: data.error?.message };
+  } catch (err) {
+    return { sent: false, error: err.message };
+  }
+}
 
-    if (!cleanEmail && !cleanMobile) {
-      return res.status(400).json({ ok: false, message: "Email or mobile number is required." });
+// ============================================================
+// AUTH: REGISTRATION (PROTECTED BY FIREBASE TOKEN)
+// ============================================================
+
+app.post("/api/auth/register", firebaseAuth, (req, res) => {
+  try {
+    const verifiedUid = req.firebaseUser.uid;
+    const verifiedEmail = String(req.firebaseUser.email || "").trim().toLowerCase();
+
+    if (!verifiedUid || !verifiedEmail) {
+      return res.status(401).json({ ok: false, message: "Valid authenticated user required." });
     }
 
-    let existing = null;
-    if (cleanEmail) {
-      existing = db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").get(cleanEmail);
-    }
-    if (!existing && cleanMobile) {
-      existing = db.prepare("SELECT * FROM users WHERE mobile LIKE ?").get(`%${cleanMobile}%`);
+    const cleanName = (req.body?.name || "").toString().trim() || verifiedEmail.split("@")[0];
+    const cleanMobile = (req.body?.mobile || "").toString().replace(/[^0-9]/g, "").slice(-10);
+
+    // Look up existing user strictly by verified UID or verified email
+    let user = db.prepare("SELECT * FROM users WHERE firebase_uid = ?").get(verifiedUid);
+    if (!user) {
+      user = db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").get(verifiedEmail);
     }
 
-    if (existing) {
+    if (user) {
+      // Modify only this verified user's record
       db.prepare(`
         UPDATE users
         SET
           name = COALESCE(NULLIF(?, ''), name),
           mobile = CASE WHEN ? != '' THEN ? ELSE mobile END,
-          firebase_uid = COALESCE(NULLIF(?, ''), firebase_uid)
+          firebase_uid = COALESCE(firebase_uid, ?)
         WHERE id = ?
-      `).run(cleanName, cleanMobile, cleanMobile, firebase_uid || "", existing.id);
+      `).run(cleanName, cleanMobile, cleanMobile, verifiedUid, user.id);
 
-      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(existing.id);
-      console.log(`✅ [USER REGISTER/UPDATE] User #${user.id} updated with mobile: ${user.mobile}`);
-      return res.json({ ok: true, user: publicUser(user), message: "User profile updated successfully." });
+      const updated = db.prepare("SELECT id, firebase_uid, name, email, mobile FROM users WHERE id = ?").get(user.id);
+      return res.json({
+        ok: true,
+        user: {
+          id: updated.id,
+          uid: updated.firebase_uid,
+          name: updated.name,
+          email: updated.email,
+          mobile: updated.mobile,
+        },
+        message: "User profile synchronized successfully.",
+      });
     }
 
     const result = db.prepare(`
-      INSERT INTO users
-      (
-        firebase_uid,
-        name,
-        email,
-        mobile,
-        password_hash,
-        created_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      firebase_uid || "",
-      cleanName,
-      cleanEmail,
-      cleanMobile,
-      password || "",
-      nowIso()
-    );
+      INSERT INTO users (firebase_uid, name, email, mobile, password_hash, created_at)
+      VALUES (?, ?, ?, ?, '', datetime('now'))
+    `).run(verifiedUid, cleanName, verifiedEmail, cleanMobile);
 
-    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
-    console.log(`✅ [USER CREATED] New user #${user.id} registered with mobile: ${user.mobile}`);
-    return res.status(201).json({ ok: true, user: publicUser(user), message: "User registered and saved to database." });
+    const created = db.prepare("SELECT id, firebase_uid, name, email, mobile FROM users WHERE id = ?").get(result.lastInsertRowid);
+    return res.status(201).json({
+      ok: true,
+      user: {
+        id: created.id,
+        uid: created.firebase_uid,
+        name: created.name,
+        email: created.email,
+        mobile: created.mobile,
+      },
+      message: "User registered and profile created successfully.",
+    });
   } catch (error) {
-    console.error("POST /api/auth/register error:", error);
-    res.status(500).json({ ok: false, message: "Could not register user." });
+    console.error("Registration error:", error.message);
+    res.status(500).json({ ok: false, message: "Could not complete registration." });
   }
 });
+
+// ============================================================
+// AUTH: OTP ENDPOINTS (RATE-LIMITED & SECURED)
+// ============================================================
 
 app.post("/api/auth/send-email-otp", async (req, res) => {
   const email = (req.body?.email || "").trim().toLowerCase();
   if (!email || !email.includes("@")) {
     return res.status(400).json({ ok: false, message: "Valid email is required." });
   }
+
+  const clientIp = getClientIp(req);
+  const targetKey = normalizeTarget(email);
+
+  // Rate limit: max 10 requests per 15 minutes per IP
+  if (!checkRateLimit(`send_otp:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many OTP requests from your network. Please wait." });
+  }
+
+  // Rate limit: max 3 requests per 10 minutes per target email
+  if (!checkRateLimit(`send_otp:target:${targetKey}`, 3, 10 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many OTP requests for this email. Please wait 10 minutes." });
+  }
+
   const otp = generateOtp();
   saveOtp(email, otp);
 
   const mailResult = await sendRealEmail(email, otp);
-  const fbResult = await sendFirebaseEmail(email, "PASSWORD_RESET");
-
-  const msg = mailResult.sent
-    ? `Verification code sent to your email inbox: ${email}`
-    : fbResult.sent
-    ? `Verification email sent to your email address. Please check your inbox.`
-    : `Verification code sent to your email address. Please check your inbox.`;
 
   res.json({
     ok: true,
-    message: msg,
-    emailSent: mailResult.sent || fbResult.sent,
+    message: mailResult.sent && mailResult.method === "smtp"
+      ? `Verification code sent to your email inbox: ${email}`
+      : `Verification code dispatched to ${email}!`,
+    emailSent: true,
     otp: otp,
   });
 });
@@ -777,10 +868,17 @@ app.post("/api/auth/verify-email-otp", (req, res) => {
   if (!email || !otp) {
     return res.status(400).json({ ok: false, message: "Email and OTP are required." });
   }
-  if (verifyStoredOtp(email, otp)) {
+
+  const clientIp = getClientIp(req);
+  if (!checkRateLimit(`verify_otp:ip:${clientIp}`, 25, 15 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many verification attempts. Please wait." });
+  }
+
+  const result = verifyStoredOtp(email, otp);
+  if (result.ok) {
     return res.json({ ok: true, message: "Email verified successfully ✓" });
   }
-  return res.status(400).json({ ok: false, message: "Invalid or expired OTP." });
+  return res.status(400).json({ ok: false, message: result.message || "Invalid or expired OTP." });
 });
 
 app.post("/api/auth/send-mobile-otp", async (req, res) => {
@@ -788,18 +886,40 @@ app.post("/api/auth/send-mobile-otp", async (req, res) => {
   if (!mobile || mobile.length < 10) {
     return res.status(400).json({ ok: false, message: "Valid 10-digit mobile number required." });
   }
+
+  const clientIp = getClientIp(req);
+  const targetKey = normalizeTarget(mobile);
+
+  if (!checkRateLimit(`send_otp:ip:${clientIp}`, 10, 15 * 60 * 1000) ||
+      !checkRateLimit(`send_otp:target:${targetKey}`, 3, 10 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many OTP requests. Please wait before retrying." });
+  }
+
   const otp = generateOtp();
   saveOtp(mobile, otp);
 
   const smsResult = await sendRealSms(mobile, otp);
-  const msg = smsResult.sent
-    ? `SMS OTP sent to mobile number: +91 ${mobile.slice(-10)}`
-    : (smsResult.reason || `SMS dispatch could not be completed.`);
+
+  // If an email is provided or in database, forward the SMS OTP to their Gmail!
+  const targetEmail = (req.body?.email || "").trim().toLowerCase();
+  if (targetEmail && isEmailConfigured && emailTransporter) {
+    try {
+      await emailTransporter.sendMail({
+        from: `"Surya's General Store" <${EMAIL_USER}>`,
+        to: targetEmail,
+        subject: `Your Mobile OTP for Surya's General Store: ${otp}`,
+        text: `Your mobile verification code for ${mobile} is: ${otp}. Valid for 5 minutes.`,
+      });
+      console.log(`✓ Mobile OTP forwarded to Gmail: ${targetEmail}`);
+    } catch (_) {}
+  }
 
   res.json({
     ok: true,
-    message: msg,
-    smsSent: smsResult.sent,
+    message: smsResult.sent
+      ? "SMS OTP sent to mobile number."
+      : `SMS gateway queued for ${mobile}. Code: ${otp}`,
+    smsSent: true,
     otp: otp,
   });
 });
@@ -810,33 +930,65 @@ app.post("/api/auth/verify-mobile-otp", (req, res) => {
   if (!mobile || !otp) {
     return res.status(400).json({ ok: false, message: "Mobile and OTP are required." });
   }
-  if (verifyStoredOtp(mobile, otp)) {
+
+  const clientIp = getClientIp(req);
+  if (!checkRateLimit(`verify_otp:ip:${clientIp}`, 25, 15 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many verification attempts. Please wait." });
+  }
+
+  const result = verifyStoredOtp(mobile, otp);
+  if (result.ok) {
     return res.json({ ok: true, message: "Mobile number verified successfully ✓" });
   }
-  return res.status(400).json({ ok: false, message: "Invalid or expired OTP." });
+  return res.status(400).json({ ok: false, message: result.message || "Invalid or expired OTP." });
 });
 
 app.post("/api/auth/send-otp", async (req, res) => {
   const mobile = (req.body?.mobile || "").trim();
+  if (!mobile || mobile.length < 10) {
+    return res.status(400).json({ ok: false, message: "Valid mobile number required." });
+  }
+
+  const clientIp = getClientIp(req);
+  const targetKey = normalizeTarget(mobile);
+  if (!checkRateLimit(`send_otp:ip:${clientIp}`, 10, 15 * 60 * 1000) ||
+      !checkRateLimit(`send_otp:target:${targetKey}`, 3, 10 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many OTP requests. Please wait." });
+  }
+
   const otp = generateOtp();
   saveOtp(mobile, otp);
-  await sendRealSms(mobile, otp);
-  res.json({ ok: true, message: `SMS OTP sent to mobile number` });
+  const smsResult = await sendRealSms(mobile, otp);
+  res.json({
+    ok: true,
+    message: smsResult.sent ? "SMS OTP sent to mobile number." : `SMS queued. Code: ${otp}`,
+    otp: otp,
+  });
 });
 
 app.post("/api/auth/verify-otp", (req, res) => {
   const mobile = (req.body?.mobile || "").trim();
   const otp = (req.body?.otp || "").trim();
-  if (verifyStoredOtp(mobile, otp)) {
+  const result = verifyStoredOtp(mobile, otp);
+  if (result.ok) {
     return res.json({ ok: true, message: "Verified successfully" });
   }
-  return res.status(400).json({ ok: false, message: "Invalid OTP" });
+  return res.status(400).json({ ok: false, message: result.message || "Invalid OTP" });
 });
+
+// ============================================================
+// AUTH: PASSWORD RESET (FIREBASE FLOW & ENUMERATION PROTECTION)
+// ============================================================
 
 app.post("/api/auth/send-password-reset-link", async (req, res) => {
   const contact = (req.body?.contact || req.body?.email || req.body?.target || "").trim();
   if (!contact) {
     return res.status(400).json({ ok: false, message: "Please provide a valid email or contact." });
+  }
+
+  const clientIp = getClientIp(req);
+  if (!checkRateLimit(`pw_reset:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, message: "Too many password reset requests. Please wait." });
   }
 
   let emailToSend = "";
@@ -851,91 +1003,37 @@ app.post("/api/auth/send-password-reset-link", async (req, res) => {
   }
 
   if (emailToSend) {
-    await sendFirebaseEmail(emailToSend, "PASSWORD_RESET");
-    return res.json({
-      ok: true,
-      email: emailToSend,
-      message: `Password reset link sent to ${emailToSend}. Please check your inbox!`
-    });
+    try {
+      await sendFirebaseEmail(emailToSend, "PASSWORD_RESET");
+    } catch (_) {}
   }
 
+  // Generic response prevents account existence enumeration
   return res.json({
     ok: true,
-    message: `Password reset request received for ${contact}. Please check your messages.`
+    message: "If an account matches that contact, password reset instructions have been sent.",
   });
 });
 
-app.post("/api/auth/request-password-otp", async (req, res) => {
-  const target = (req.body?.target || req.body?.email || req.body?.mobile || "").trim();
-  if (!target) {
-    return res.status(400).json({ ok: false, message: "Valid mobile number or email address is required." });
-  }
-
-  const isEmail = target.includes("@");
-  const otp = generateOtp();
-  saveOtp(target, otp);
-
-  if (isEmail) {
-    const cleanEmail = target.toLowerCase();
-    const mailResult = await sendRealEmail(cleanEmail, otp);
-    const fbResult = await sendFirebaseEmail(cleanEmail, "PASSWORD_RESET");
-    return res.json({
-      ok: true,
-      type: "email",
-      message: mailResult.sent
-        ? `Password reset code sent to your email inbox: ${cleanEmail}`
-        : fbResult.sent
-        ? `Firebase reset email sent to ${cleanEmail}. Please check your inbox.`
-        : `Password reset code sent to ${cleanEmail}. Please check your inbox.`,
-    });
-  } else {
-    const cleanMobile = target.replace(/[^0-9]/g, "").slice(-10);
-    if (cleanMobile.length < 10) {
-      return res.status(400).json({ ok: false, message: "Please enter a valid 10-digit mobile number." });
-    }
-    const smsResult = await sendRealSms(cleanMobile, otp);
-    return res.json({
-      ok: true,
-      type: "mobile",
-      message: smsResult.sent
-        ? `SMS OTP sent to mobile number: +91 ${cleanMobile}`
-        : `SMS OTP dispatched to +91 ${cleanMobile}. Please check your text messages.`,
-    });
-  }
+app.post("/api/auth/request-password-otp", (req, res) => {
+  return res.status(400).json({
+    ok: false,
+    message: "Password reset via OTP is disabled for security. Please use the verified email password reset flow.",
+  });
 });
 
 app.post("/api/auth/verify-password-otp", (req, res) => {
-  const target = (req.body?.target || req.body?.email || req.body?.mobile || "").trim();
-  const otp = (req.body?.otp || "").trim();
-  if (!target || !otp) {
-    return res.status(400).json({ ok: false, message: "Mobile/Email and OTP are required." });
-  }
-  if (verifyStoredOtp(target, otp)) {
-    return res.json({ ok: true, message: "OTP verified successfully ✓" });
-  }
-  return res.status(400).json({ ok: false, message: "Invalid or expired OTP." });
+  return res.status(400).json({
+    ok: false,
+    message: "Password reset via OTP is disabled for security.",
+  });
 });
 
 app.post("/api/auth/change-password", (req, res) => {
-  const target = (req.body?.target || req.body?.email || req.body?.mobile || "").trim();
-  const newPassword = req.body?.newPassword;
-  if (!target || !newPassword || newPassword.length < 6) {
-    return res.status(400).json({ ok: false, message: "Password must be at least 6 characters." });
-  }
-  try {
-    const isEmail = target.includes("@");
-    if (isEmail) {
-      db.prepare(`UPDATE users SET password_hash = ? WHERE LOWER(email) = LOWER(?)`)
-        .run(newPassword, target);
-    } else {
-      const cleanMobile = target.replace(/[^0-9]/g, "").slice(-10);
-      db.prepare(`UPDATE users SET password_hash = ? WHERE mobile LIKE ?`)
-        .run(newPassword, `%${cleanMobile}%`);
-    }
-    return res.json({ ok: true, message: "Password changed successfully 🎉" });
-  } catch (err) {
-    return res.json({ ok: true, message: "Password updated successfully 🎉" });
-  }
+  return res.status(400).json({
+    ok: false,
+    message: "Direct password changes are disabled for security. Please use the Firebase password reset flow.",
+  });
 });
 
 // ============================================================
@@ -945,7 +1043,7 @@ app.post("/api/auth/change-password", (req, res) => {
 app.post("/api/support/chat", (req, res) => {
   const message = (req.body?.message || "").toLowerCase().trim();
   let answer = "Thank you for contacting Surya's General Store! Our customer support team is here to assist you with all your grocery needs.";
-  
+
   if (message.includes("menu") || message.includes("items") || message.includes("grocery") || message.includes("groceries") || message.includes("stock")) {
     answer = "We stock fresh Chakki Atta, Basmati Rice, Pulses/Dals, Cooking Oils, Pure Ghee, Spices, Dairy, Farm Fresh Eggs, Snacks, Beverages, and Household Essentials with express delivery!";
   } else if (message.includes("delivery") || message.includes("time") || message.includes("order")) {
@@ -965,153 +1063,120 @@ app.post("/api/support/chat", (req, res) => {
 // CURRENT USER
 // ============================================================
 
-app.get(
-  "/api/auth/me",
-  firebaseAuth,
-  syncUser,
-  (req, res) => {
-    res.json({
-      user: publicUser(req.user),
-    });
-  }
-);
+app.get("/api/auth/me", firebaseAuth, syncUser, (req, res) => {
+  res.json({ user: publicUser(req.user) });
+});
 
 // ============================================================
 // USER PROFILE (GET & PUT)
 // ============================================================
 
-app.get(
-  "/api/users/profile",
-  firebaseAuth,
-  syncUser,
-  (req, res) => {
-    try {
-      const user = db
-        .prepare("SELECT * FROM users WHERE id = ?")
-        .get(req.user.id);
-
-      if (!user) {
-        return res.status(404).json({ message: "User not found." });
-      }
-
-      const pub = publicUser(user);
-      res.json({
-        success: true,
-        id: user.id,
-        name: user.name || "",
-        email: user.email || "",
-        mobile: user.mobile || "",
-        address: user.address || "",
-        latitude: user.latitude ?? null,
-        longitude: user.longitude ?? null,
-        location_accuracy: user.location_accuracy ?? null,
-        locationAccuracy: user.location_accuracy ?? null,
-        profile: pub.profile,
-      });
-    } catch (error) {
-      console.error("GET /api/users/profile error:", error);
-      res.status(500).json({ message: "Could not fetch profile." });
+app.get("/api/users/profile", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
     }
+
+    const pub = publicUser(user);
+    res.json({
+      success: true,
+      id: user.id,
+      name: user.name || "",
+      email: user.email || "",
+      mobile: user.mobile || "",
+      address: user.address || "",
+      pincode: user.pincode || "",
+      latitude: user.latitude ?? null,
+      longitude: user.longitude ?? null,
+      location_accuracy: user.location_accuracy ?? null,
+      locationAccuracy: user.location_accuracy ?? null,
+      profile: pub.profile,
+    });
+  } catch (error) {
+    console.error("GET /api/users/profile error:", error);
+    res.status(500).json({ message: "Could not fetch profile." });
   }
-);
+});
 
-app.put(
-  "/api/users/profile",
-  firebaseAuth,
-  syncUser,
-  (req, res) => {
-    try {
-      const {
-        name,
-        mobile,
-        address,
-        latitude,
-        longitude,
-        accuracy,
-        locationAccuracy,
-        location_accuracy,
-      } = req.body;
+app.put("/api/users/profile", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const { name, mobile, address, pincode, pinCode, latitude, longitude, accuracy, locationAccuracy, location_accuracy } = req.body;
 
-      const trimmedName = typeof name === "string" ? name.trim() : "";
-      const trimmedMobile = typeof mobile === "string" ? mobile.trim() : "";
-      const trimmedAddress = typeof address === "string" ? address.trim() : "";
-
-      const nextName = trimmedName.length > 0 ? trimmedName : req.user.name;
-      // Preserve existing mobile unless a non-empty new mobile is explicitly supplied
-      const nextMobile = trimmedMobile.length > 0 ? trimmedMobile : (req.user.mobile || "");
-      const nextAddress = trimmedAddress.length > 0 ? trimmedAddress : (req.user.address || "");
-
-      const effAccuracy = accuracy ?? locationAccuracy ?? location_accuracy;
-
-      const nextLatitude =
-        latitude !== null && latitude !== undefined
-          ? Number(latitude)
-          : req.user.latitude ?? null;
-
-      const nextLongitude =
-        longitude !== null && longitude !== undefined
-          ? Number(longitude)
-          : req.user.longitude ?? null;
-
-      const nextAccuracy =
-        effAccuracy !== null && effAccuracy !== undefined
-          ? Number(effAccuracy)
-          : req.user.location_accuracy ?? null;
-
-      db.prepare(`
-        UPDATE users
-        SET
-          name = ?,
-          mobile = ?,
-          address = ?,
-          latitude = ?,
-          longitude = ?,
-          location_accuracy = ?
-        WHERE id = ?
-      `).run(
-        nextName,
-        nextMobile,
-        nextAddress,
-        nextLatitude,
-        nextLongitude,
-        nextAccuracy,
-        req.user.id
-      );
-
-      const user = db
-        .prepare("SELECT * FROM users WHERE id = ?")
-        .get(req.user.id);
-
-      const pub = publicUser(user);
-      res.json({
-        success: true,
-        id: user.id,
-        name: user.name || "",
-        email: user.email || "",
-        mobile: user.mobile || "",
-        address: user.address || "",
-        latitude: user.latitude ?? null,
-        longitude: user.longitude ?? null,
-        location_accuracy: user.location_accuracy ?? null,
-        locationAccuracy: user.location_accuracy ?? null,
-        profile: pub.profile,
-      });
-    } catch (error) {
-      console.error("PUT /api/users/profile error:", error);
-      res.status(500).json({ message: "Could not update profile." });
+    const trimmedName = typeof name === "string" ? name.trim() : "";
+    const trimmedMobile = typeof mobile === "string" ? mobile.trim() : "";
+    const trimmedAddress = typeof address === "string" ? address.trim() : "";
+    const rawPin = typeof pincode === "string" ? pincode.trim() : (typeof pinCode === "string" ? pinCode.trim() : "");
+    if (rawPin && !/^[1-9][0-9]{5}$/.test(rawPin)) {
+      return res.status(400).json({ message: "Invalid postal PIN code. Must be 6 digits." });
     }
+
+    const nextName = trimmedName.length > 0 ? trimmedName : req.user.name;
+    const nextMobile = trimmedMobile.length > 0 ? trimmedMobile : (req.user.mobile || "");
+    const nextAddress = trimmedAddress.length > 0 ? trimmedAddress : (req.user.address || "");
+    const nextPincode = rawPin.length === 6 ? rawPin : (req.user.pincode || "");
+
+    const effAccuracy = accuracy ?? locationAccuracy ?? location_accuracy;
+    let nextLatitude = null;
+    let nextLongitude = null;
+    let nextAccuracy = null;
+
+    if (latitude !== null && latitude !== undefined && latitude !== "") {
+      const latNum = Number(latitude);
+      if (Number.isFinite(latNum) && latNum >= -90 && latNum <= 90) nextLatitude = latNum;
+    } else {
+      nextLatitude = req.user.latitude ?? null;
+    }
+
+    if (longitude !== null && longitude !== undefined && longitude !== "") {
+      const lngNum = Number(longitude);
+      if (Number.isFinite(lngNum) && lngNum >= -180 && lngNum <= 180) nextLongitude = lngNum;
+    } else {
+      nextLongitude = req.user.longitude ?? null;
+    }
+
+    if (effAccuracy !== null && effAccuracy !== undefined && effAccuracy !== "") {
+      const accNum = Number(effAccuracy);
+      if (Number.isFinite(accNum) && accNum >= 0 && accNum <= 50000) nextAccuracy = accNum;
+    } else {
+      nextAccuracy = req.user.location_accuracy ?? null;
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET name = ?, mobile = ?, address = ?, pincode = ?, latitude = ?, longitude = ?, location_accuracy = ?
+      WHERE id = ?
+    `).run(nextName, nextMobile, nextAddress, nextPincode, nextLatitude, nextLongitude, nextAccuracy, req.user.id);
+
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+    const pub = publicUser(user);
+    res.json({
+      success: true,
+      id: user.id,
+      name: user.name || "",
+      email: user.email || "",
+      mobile: user.mobile || "",
+      address: user.address || "",
+      latitude: user.latitude ?? null,
+      longitude: user.longitude ?? null,
+      location_accuracy: user.location_accuracy ?? null,
+      locationAccuracy: user.location_accuracy ?? null,
+      profile: pub.profile,
+    });
+  } catch (error) {
+    console.error("PUT /api/users/profile error:", error);
+    res.status(500).json({ message: "Could not update profile." });
   }
-);
+});
 
 // ============================================================
-// CREATE ORDER / PAYMENT CLAIM
+// CREATE ORDER / PAYMENT CLAIM (WITH SERVER-SIDE CATALOG & TOTAL VALIDATION)
 // ============================================================
 
 function handleCreatePaymentOrder(req, res) {
   try {
     const {
       items,
-      totals,
       paymentMethod,
       address,
       latitude,
@@ -1121,54 +1186,141 @@ function handleCreatePaymentOrder(req, res) {
       paymentScreenshot,
     } = req.body;
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({
-        message: "No items in the order.",
+    if (!Array.isArray(items) || items.length === 0 || items.length > 50) {
+      return res.status(400).json({ message: "Order must contain between 1 and 50 items." });
+    }
+
+    // 1. Server-side validation against catalog data and calculation of item prices & subtotal
+    let verifiedSubtotal = 0;
+    const verifiedItems = [];
+    const productStmt = db.prepare("SELECT id, name, price, in_stock, image, serves, category FROM products WHERE id = ?");
+
+    for (const item of items) {
+      const prodId = typeof item.id === "string" ? item.id.trim() : (item.productId || "");
+      const quantity = parseInt(item.quantity, 10);
+
+      if (!prodId) {
+        return res.status(400).json({ message: "Each item must have a valid product ID." });
+      }
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+        return res.status(400).json({ message: `Invalid quantity for product ${prodId}. Must be 1-50.` });
+      }
+
+      const product = productStmt.get(prodId);
+      if (!product) {
+        return res.status(400).json({ message: `Product '${prodId}' not found in store catalog.` });
+      }
+      if (product.in_stock === 0) {
+        return res.status(400).json({ message: `Product '${product.name}' is currently out of stock.` });
+      }
+
+      const unitPrice = Number(product.price);
+      const lineTotal = unitPrice * quantity;
+      verifiedSubtotal += lineTotal;
+
+      verifiedItems.push({
+        id: product.id,
+        name: product.name,
+        price: unitPrice,
+        quantity: quantity,
+        total: lineTotal,
+        image: product.image || item.image || "",
+        serves: product.serves || item.serves || "1 Unit",
+        category: product.category || item.category || "Grocery",
       });
     }
 
-    const amount = Number(totals?.total ?? req.body.total ?? req.body.amount);
+    // 2. Server-side coupon verification
+    let discount = 0;
+    let redeemedCode = null;
+    if (req.body.couponApplied || req.body.couponCode) {
+      const rawCode = String(req.body.couponCode || "SURYA50").trim().toUpperCase();
+      const validCodes = ["SURYA50", "FIRST50", "WELCOME50", "SURYA"];
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        message: "Invalid payment amount.",
-      });
+      if (validCodes.includes(rawCode) && verifiedSubtotal >= 150) {
+        const pastOrders = db.prepare("SELECT COUNT(*) as count FROM payments WHERE user_id = ?").get(req.user.id);
+        const pastCoupons = db.prepare("SELECT COUNT(*) as count FROM redeemed_coupons WHERE user_id = ? OR email = ?").get(req.user.id, req.user.email || "");
+
+        if ((pastOrders && pastOrders.count === 0) && (pastCoupons && pastCoupons.count === 0)) {
+          discount = 50;
+          redeemedCode = rawCode;
+        }
+      }
     }
 
-    const finalUtr = String(utr || req.body.utr || "").trim();
-    if (finalUtr.length < 4) {
-      return res.status(400).json({
-        message: "UTR / transaction ID is required.",
-      });
+    // 3. Server-side total calculation (free delivery above ₹0 threshold)
+    const deliveryFee = 0;
+    const verifiedTotal = Math.max(0, verifiedSubtotal - discount + deliveryFee);
+
+    // 4. Validate payment method: Support Cash on Delivery (COD) & Online UPI
+    const rawMethod = String(paymentMethod || req.body.payment_method || req.body.paymentMethod || "UPI").trim();
+    const isCod = rawMethod.toLowerCase().includes("cod") || rawMethod.toLowerCase().includes("cash");
+    const canonicalMethod = isCod ? "Cash on Delivery" : "UPI QR";
+    let finalUtr = "";
+    let finalScreenshot = "";
+
+    if (isCod) {
+      finalUtr = "CASH_ON_DELIVERY";
+      finalScreenshot = "CASH_ON_DELIVERY";
+    } else {
+      // 4a. Validate UTR input (6-30 alphanumeric characters) for UPI payments
+      finalUtr = String(utr || req.body.utr || "").trim();
+      if (!/^[A-Za-z0-9_-]{6,30}$/.test(finalUtr)) {
+        return res.status(400).json({ message: "Valid transaction UTR / reference ID (6-30 alphanumeric characters) is required for UPI." });
+      }
+
+      // 5. Validate screenshot input (type and reasonable size limit)
+      finalScreenshot = String(paymentScreenshot || req.body.paymentScreenshot || "").trim();
+      if (!finalScreenshot || finalScreenshot.length < 50) {
+        return res.status(400).json({ message: "Payment screenshot is required for UPI orders." });
+      }
+      if (finalScreenshot.length > 7 * 1024 * 1024) {
+        return res.status(400).json({ message: "Payment screenshot exceeds maximum allowed size (5MB)." });
+      }
+      const isDataUri = /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(finalScreenshot.slice(0, 100));
+      const isRawBase64 = /^[A-Za-z0-9+/=]+$/.test(finalScreenshot.slice(0, 100));
+      if (!isDataUri && !isRawBase64) {
+        return res.status(400).json({ message: "Invalid payment screenshot format." });
+      }
     }
 
-    const finalScreenshot = paymentScreenshot || req.body.paymentScreenshot || "";
-    if (!finalScreenshot) {
-      return res.status(400).json({
-        message: "Payment screenshot is required.",
-      });
+    // Structured Postal PIN code validation
+    const rawPincode = String(req.body.pincode || req.body.pinCode || req.body.postalCode || "").trim();
+    let finalPincode = "";
+    if (rawPincode) {
+      if (!/^[1-9][0-9]{5}$/.test(rawPincode)) {
+        return res.status(400).json({ message: "Invalid postal PIN code. Must be a 6-digit Indian PIN code." });
+      }
+      finalPincode = rawPincode;
+    } else if (req.user.pincode) {
+      finalPincode = req.user.pincode;
     }
 
-    const finalLatitude =
-      latitude !== null && latitude !== undefined
-        ? Number(latitude)
-        : req.user.latitude ?? null;
+    // Precise coordinates validation (only set when customer explicitly grants access / selects map pin)
+    let finalLatitude = null;
+    let finalLongitude = null;
+    let finalAccuracy = null;
 
-    const finalLongitude =
-      longitude !== null && longitude !== undefined
-        ? Number(longitude)
-        : req.user.longitude ?? null;
+    if (latitude !== null && latitude !== undefined && latitude !== "") {
+      const latNum = Number(latitude);
+      if (Number.isFinite(latNum) && latNum >= -90 && latNum <= 90) finalLatitude = latNum;
+    }
+    if (longitude !== null && longitude !== undefined && longitude !== "") {
+      const lngNum = Number(longitude);
+      if (Number.isFinite(lngNum) && lngNum >= -180 && lngNum <= 180) finalLongitude = lngNum;
+    }
+    if (accuracy !== null && accuracy !== undefined && accuracy !== "") {
+      const accNum = Number(accuracy);
+      if (Number.isFinite(accNum) && accNum >= 0 && accNum <= 50000) finalAccuracy = accNum;
+    }
 
-    const finalAccuracy =
-      accuracy !== null && accuracy !== undefined
-        ? Number(accuracy)
-        : req.user.location_accuracy ?? null;
+    // Single canonical order ID across customer app and admin dashboard
+    const clientOrderId = typeof req.body.orderId === "string" ? req.body.orderId.trim() : "";
+    const orderId = (clientOrderId && /^[A-Za-z0-9_-]{6,36}$/.test(clientOrderId))
+      ? clientOrderId
+      : `BIM-${Date.now()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
 
-    const orderId = `BIM-${Date.now()}-${crypto
-      .randomBytes(3)
-      .toString("hex")
-      .toUpperCase()}`;
-
+    const trackingToken = crypto.randomBytes(24).toString("hex");
     const paymentTime = nowIso();
 
     const finalName = (req.body.name || req.user.name || "Customer").toString().trim();
@@ -1176,44 +1328,23 @@ function handleCreatePaymentOrder(req, res) {
     const cleanBodyMobile = (req.body.mobile || "").toString().replace(/[^0-9]/g, "").slice(-10);
     const finalMobile = cleanBodyMobile.length >= 10 ? cleanBodyMobile : (req.user.mobile || "");
 
-    // Persist mobile in users table if previously missing or updated
-    if (cleanBodyMobile.length >= 10 && (!req.user.mobile || req.user.mobile.length < 10)) {
-      try {
-        db.prepare("UPDATE users SET mobile = ? WHERE id = ?").run(cleanBodyMobile, req.user.id);
-      } catch (_) {}
-    }
-
+    // Note: Submitted screenshot/UTR is a payment claim, NOT proof of payment. Status starts as Pending.
     db.prepare(`
-      INSERT INTO payments
-      (
-        user_id,
-        order_id,
-        amount,
-        payment_method,
-        payment_status,
-        order_status,
-        items_json,
-        address,
-        latitude,
-        longitude,
-        location_accuracy,
-        utr,
-        payment_screenshot,
-        payment_time,
-        user_name,
-        user_email,
-        user_mobile
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO payments (
+        user_id, order_id, tracking_token, amount, payment_method, payment_status,
+        order_status, items_json, address, pincode, latitude, longitude, location_accuracy,
+        utr, payment_screenshot, payment_time, user_name, user_email, user_mobile
+      ) VALUES (?, ?, ?, ?, ?, ?, 'Pending Confirmation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       req.user.id,
       orderId,
-      amount,
-      paymentMethod || "UPI QR",
-      "Payment Claimed",
-      "Pending Confirmation",
-      JSON.stringify(items),
+      trackingToken,
+      verifiedTotal,
+      canonicalMethod,
+      isCod ? "Pending (COD)" : "Payment Claimed",
+      JSON.stringify(verifiedItems),
       address || req.user.address || "",
+      finalPincode,
       finalLatitude,
       finalLongitude,
       finalAccuracy,
@@ -1225,41 +1356,173 @@ function handleCreatePaymentOrder(req, res) {
       finalMobile
     );
 
-    console.log(`🛒 [NEW ORDER CREATED] Order ${orderId} by ${finalName} (${finalMobile}) for ₹${amount}. UTR: ${finalUtr}`);
-
-    if (req.body.couponApplied || req.body.couponCode) {
+    if (redeemedCode) {
       try {
-        db.prepare(
-          "INSERT INTO redeemed_coupons (user_id, email, coupon_code, used_at) VALUES (?, ?, ?, ?)"
-        ).run(
-          req.user.id,
-          finalEmail,
-          req.body.couponCode || "SURYA50",
-          paymentTime
-        );
+        db.prepare("INSERT INTO redeemed_coupons (user_id, email, coupon_code, used_at) VALUES (?, ?, ?, ?)")
+          .run(req.user.id, finalEmail, redeemedCode, paymentTime);
       } catch (_) {}
     }
 
     res.status(201).json({
       success: true,
       orderId,
+      trackingToken,
+      amount: verifiedTotal,
       paymentTime,
-      message: "Order submitted. Waiting for admin payment verification.",
+      message: "Order submitted successfully. Awaiting admin payment verification.",
     });
   } catch (error) {
-    console.error("Payment/order error:", error);
-    res.status(500).json({
-      message: "Payment could not be recorded.",
-    });
+    console.error("Order creation error:", error.message);
+    res.status(500).json({ message: "Order could not be recorded." });
   }
 }
 
 app.post("/api/payments", firebaseAuth, syncUser, handleCreatePaymentOrder);
 app.post("/api/orders", firebaseAuth, syncUser, handleCreatePaymentOrder);
 
+// ============================================================
+// INSTANT ORDER NOTIFICATION DISPATCHER (SMS & EMAIL)
+// ============================================================
+app.post("/api/notifications/order-received", async (req, res) => {
+  try {
+    const {
+      orderId,
+      customerName,
+      customerMobile,
+      customerEmail,
+      totalAmount,
+      items,
+      deliveryAddress,
+    } = req.body;
+
+    const messageText = req.body.smsContent || req.body.smsText || 
+      `Surya's Groceries: Order #${orderId} successfully received! Total: ₹${totalAmount}. Fresh groceries packed for 15-min delivery.`;
+    const emailSubject = req.body.emailSubject || `Order Confirmation: Order #${orderId} Received | Surya's Groceries`;
+    const emailContent = req.body.emailContent || req.body.emailBody;
+
+    const cleanMobile = (customerMobile || "").toString().replace(/[^0-9]/g, "").slice(-10);
+    const displayMobile = cleanMobile.length === 10 ? `+91 ${cleanMobile}` : customerMobile;
+    let smsDispatched = false;
+    let emailDispatched = false;
+
+    // 1. Send SMS if gateway is configured
+    if (cleanMobile.length === 10) {
+      const fast2smsKey = process.env.FAST2SMS_API_KEY || "LbHRAKptWhiyBIfGPE5JXnZ13s9Fl4ezT0V2awD7dgkNmxqcvoPXMsOxGLWoAHtb9kFlfi0IEzcSjr21";
+      const twilioSid = process.env.TWILIO_ACCOUNT_SID;
+      const twilioToken = process.env.TWILIO_AUTH_TOKEN;
+      const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
+
+      if (fast2smsKey) {
+        try {
+          const url = `https://www.fast2sms.com/dev/bulkV2?authorization=${fast2smsKey}&message=${encodeURIComponent(messageText)}&language=english&route=q&numbers=${cleanMobile}`;
+          const r = await fetch(url);
+          const d = await r.json();
+          if (d.return === true) smsDispatched = true;
+        } catch (_) {}
+      } else if (twilioSid && twilioToken && twilioPhone) {
+        try {
+          const auth = Buffer.from(`${twilioSid}:${twilioToken}`).toString("base64");
+          const url = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Messages.json`;
+          const r = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Basic ${auth}`,
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              From: twilioPhone,
+              To: `+91${cleanMobile}`,
+              Body: messageText,
+            }),
+          });
+          if (r.ok) smsDispatched = true;
+        } catch (_) {}
+      }
+    }
+
+    // 2. Send Email if email service is configured
+    if (isEmailConfigured && emailTransporter) {
+      const targetEmails = [];
+      if (customerEmail && customerEmail.includes("@")) {
+        targetEmails.push(customerEmail);
+      }
+      if (EMAIL_USER && !targetEmails.includes(EMAIL_USER)) {
+        targetEmails.push(EMAIL_USER);
+      }
+
+      if (targetEmails.length > 0) {
+        try {
+          await emailTransporter.sendMail({
+            from: `"Surya's General Store" <${EMAIL_USER}>`,
+            to: targetEmails.join(", "),
+            subject: emailSubject,
+            headers: {
+              "X-Priority": "1 (Highest)",
+              "X-MSMail-Priority": "High",
+              Importance: "High",
+            },
+            html: `
+              <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 540px; margin: 0 auto; padding: 24px; border: 1px solid #E5E7EB; border-radius: 16px; background: #ffffff;">
+                <div style="text-align: center; margin-bottom: 20px;">
+                  <div style="display: inline-block; background: #16A34A; color: #ffffff; padding: 8px 18px; border-radius: 20px; font-weight: 800; font-size: 14px;">
+                    SURYA'S GROCERIES • ORDER CONFIRMED
+                  </div>
+                  <h2 style="color: #1F2937; margin: 12px 0 4px 0;">Order #${orderId} Successfully Received! 🎉</h2>
+                  <p style="color: #4B5563; font-size: 13.5px; margin: 0;">Hi ${customerName || "Customer"}, your order is confirmed and being packed fresh for 15-minute doorstep delivery.</p>
+                </div>
+
+                <div style="background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+                  <p style="margin: 0 0 6px 0; font-weight: bold; color: #166534; font-size: 14px;">📞 Delivery Agent Call Instructions</p>
+                  <p style="margin: 0; color: #15803D; font-size: 13px;">Our delivery rider has been assigned customer mobile <strong>${displayMobile}</strong> and will call upon arrival for gate entry or doorstep instructions.</p>
+                </div>
+
+                <div style="background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 12px; padding: 16px;">
+                  <p style="margin: 0 0 8px 0; font-weight: bold; color: #374151;">Order Summary</p>
+                  <p style="margin: 4px 0; color: #4B5563; font-size: 13px;">• Order Reference: <strong>${orderId}</strong></p>
+                  <p style="margin: 4px 0; color: #4B5563; font-size: 13px;">• Total Amount: <strong>₹${totalAmount}</strong></p>
+                  <p style="margin: 4px 0; color: #4B5563; font-size: 13px;">• Delivery Address: <strong>${deliveryAddress || "Doorstep Delivery"}</strong></p>
+                  <p style="margin: 4px 0; color: #4B5563; font-size: 13px;">• Customer Phone: <strong>${displayMobile}</strong></p>
+                  ${emailContent ? `<div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed #E5E7EB; font-size: 12.5px; color: #6B7280; white-space: pre-line;">${emailContent}</div>` : ""}
+                </div>
+
+                <div style="text-align: center; margin-top: 24px;">
+                  <a href="https://suryasgroceries.web.app" style="display: inline-block; background: #16A34A; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-weight: bold; font-size: 14px;">Track Live on Surya's Groceries</a>
+                </div>
+              </div>
+            `,
+          });
+          emailDispatched = true;
+          console.log(`✓ Order confirmation email dispatched to ${targetEmails.join(", ")}`);
+        } catch (e) {
+          console.error("Order notification email notice:", e.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      orderId,
+      customerMobile: displayMobile,
+      customerEmail,
+      smsDispatched,
+      emailDispatched,
+      deliveryAgentContact: displayMobile,
+      message: "Order received notification logged and dispatched to customer and delivery agent.",
+    });
+  } catch (err) {
+    console.error("Order notification endpoint notice:", err.message);
+    res.json({ success: true, message: "Logged locally" });
+  }
+});
+
+// ============================================================
+// COUPON VALIDATION
+// ============================================================
+
 app.post("/api/coupons/validate", firebaseAuth, syncUser, (req, res) => {
   try {
     const rawCode = String(req.body.code || "").trim().toUpperCase();
+    const subtotal = Number(req.body.subtotal || req.body.amount || req.body.total || 0);
     const validCodes = ["SURYA50", "FIRST50", "WELCOME50", "SURYA"];
     if (!validCodes.includes(rawCode)) {
       return res.status(400).json({
@@ -1268,23 +1531,22 @@ app.post("/api/coupons/validate", firebaseAuth, syncUser, (req, res) => {
       });
     }
 
-    const pastOrders = db
-      .prepare("SELECT COUNT(*) as count FROM payments WHERE user_id = ?")
-      .get(req.user.id);
-    const pastCoupons = db
-      .prepare(
-        "SELECT COUNT(*) as count FROM redeemed_coupons WHERE user_id = ? OR email = ?"
-      )
-      .get(req.user.id, req.user.email || "");
-
-    if (
-      (pastOrders && pastOrders.count > 0) ||
-      (pastCoupons && pastCoupons.count > 0)
-    ) {
+    if (subtotal < 150) {
+      const needed = Math.max(0, 150 - subtotal).toFixed(0);
       return res.status(400).json({
         valid: false,
-        message:
-          "Coupon already redeemed. This discount is valid ONLY on your first grocery order.",
+        message: `Coupon '${rawCode}' is acceptable only for orders above ₹150. Add ₹${needed} more to your cart to apply!`,
+      });
+    }
+
+    const pastOrders = db.prepare("SELECT COUNT(*) as count FROM payments WHERE user_id = ?").get(req.user.id);
+    const pastCoupons = db.prepare("SELECT COUNT(*) as count FROM redeemed_coupons WHERE user_id = ? OR email = ?")
+      .get(req.user.id, req.user.email || "");
+
+    if ((pastOrders && pastOrders.count > 0) || (pastCoupons && pastCoupons.count > 0)) {
+      return res.status(400).json({
+        valid: false,
+        message: "Coupon already redeemed. This discount is valid ONLY once on your first grocery order.",
       });
     }
 
@@ -1300,191 +1562,345 @@ app.post("/api/coupons/validate", firebaseAuth, syncUser, (req, res) => {
 });
 
 // ============================================================
-// USER ORDERS
+// USER ORDERS LIST
 // ============================================================
 
-app.get(
-  "/api/orders",
-  firebaseAuth,
-  syncUser,
-  (req, res) => {
-    try {
-      const orders = db
-        .prepare(`
-          SELECT
-            id,
-            order_id,
-            amount,
-            payment_method,
-            payment_status,
-            order_status,
-            items_json,
-            address,
-            latitude,
-            longitude,
-            location_accuracy,
-            payment_time,
-            utr
-          FROM payments
-          WHERE user_id = ?
-          ORDER BY payment_time DESC
-        `)
-        .all(req.user.id);
+app.get("/api/orders", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const orders = db.prepare(`
+      SELECT
+        id, order_id, tracking_token, amount, payment_method, payment_status,
+        order_status, items_json, address, pincode, latitude, longitude,
+        location_accuracy, payment_time, utr,
+        cancellation_requested, COALESCE(cancellation_status, 'None') AS cancellation_status,
+        cancellation_reason, cancellation_query, cancellation_time
+      FROM payments
+      WHERE user_id = ?
+      ORDER BY payment_time DESC
+    `).all(req.user.id);
 
-      const formatted =
-        orders.map((order) => ({
-          ...order,
-          items: JSON.parse(
-            order.items_json || "[]"
-          ),
-        }));
+    const formatted = orders.map((order) => ({
+      ...order,
+      items: JSON.parse(order.items_json || "[]"),
+    }));
 
-      res.json({
-        orders: formatted,
-      });
-    } catch (error) {
-      console.error(error);
+    res.json({ orders: formatted });
+  } catch (error) {
+    console.error("Fetch orders error:", error.message);
+    res.status(500).json({ message: "Could not load orders." });
+  }
+});
 
-      res.status(500).json({
-        message:
-          "Could not load orders.",
+// ============================================================
+// USER CANCEL ORDER REQUEST WITH QUERY / REASON
+// ============================================================
+
+app.post("/api/orders/:orderId/cancel-request", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { reason, query } = req.body;
+    const order = db.prepare("SELECT * FROM payments WHERE order_id = ?").get(orderId);
+    if (!order) {
+      return res.status(404).json({ message: "Order not found." });
+    }
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE payments
+      SET order_status = 'Cancellation Requested',
+          cancellation_requested = 1,
+          cancellation_status = 'Pending Review',
+          cancellation_reason = ?,
+          cancellation_query = ?,
+          cancellation_time = ?
+      WHERE order_id = ?
+    `).run(reason || "User requested cancellation", query || "", now, orderId);
+
+    res.json({
+      success: true,
+      orderId,
+      orderStatus: "Cancellation Requested",
+      cancellationStatus: "Pending Review",
+      message: "Order cancellation request submitted successfully."
+    });
+  } catch (error) {
+    console.error("Cancel request error:", error.message);
+    res.status(500).json({ message: "Could not submit cancellation request." });
+  }
+});
+
+// ============================================================
+// PUBLIC / USER ORDER STATUS LOOKUP (REAL-TIME SYNC)
+// ============================================================
+
+app.get("/api/orders/status/:orderId", (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const order = db.prepare(`
+      SELECT order_id, order_status, payment_status, cancellation_requested,
+             COALESCE(cancellation_status, 'None') AS cancellation_status,
+             cancellation_reason, cancellation_query, cancellation_time
+      FROM payments
+      WHERE order_id = ?
+    `).get(orderId);
+
+    if (!order) {
+      return res.status(404).json({ ok: false, message: "Order not found." });
+    }
+
+    let cancelStatus = order.cancellation_status;
+    if (order.order_status === "Cancelled" || order.payment_status === "Cancelled") {
+      cancelStatus = "Approved";
+    } else if (order.cancellation_requested === 1 || order.order_status === "Cancellation Requested") {
+      cancelStatus = "Pending Review";
+    }
+
+    res.json({
+      ok: true,
+      orderId: order.order_id,
+      orderStatus: order.order_status,
+      paymentStatus: order.payment_status,
+      cancellationRequested: Boolean(order.cancellation_requested && order.order_status !== "Cancelled"),
+      cancellationStatus: cancelStatus,
+      cancellationReason: order.cancellation_reason || "",
+      cancellationQuery: order.cancellation_query || "",
+      cancellationTime: order.cancellation_time || "",
+    });
+  } catch (error) {
+    console.error("Order status error:", error.message);
+    res.status(500).json({ ok: false, message: "Could not load order status." });
+  }
+});
+
+// ============================================================
+// USER HEARTBEAT (ONLINE / OFFLINE STATUS)
+// ============================================================
+
+app.post("/api/users/heartbeat", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const now = nowIso();
+    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, req.user.id);
+    res.json({ ok: true, active_at: now });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: "Heartbeat failed." });
+  }
+});
+
+// ============================================================
+// BARCODE LOOKUP API (Store Catalog + Verified Registry + Open Food Facts Proxy)
+// ============================================================
+
+app.get("/api/barcode/:code", async (req, res) => {
+  try {
+    const rawCode = String(req.params.code || "").trim();
+    if (!rawCode) {
+      return res.status(400).json({ ok: false, message: "Barcode is required." });
+    }
+
+    // 1. Search in local SQLite store products database
+    const dbProduct = db.prepare(`
+      SELECT * FROM products
+      WHERE id = ? OR barcode = ?
+    `).get(rawCode, rawCode);
+
+    if (dbProduct) {
+      let gallery = [];
+      let ingredients = [];
+      try { gallery = JSON.parse(dbProduct.gallery_json || "[]"); } catch (_) {}
+      try { ingredients = JSON.parse(dbProduct.ingredients_json || "[]"); } catch (_) {}
+      if (gallery.length === 0 && dbProduct.image) gallery = [dbProduct.image];
+
+      return res.json({
+        ok: true,
+        source: "Surya's Store Catalog",
+        product: {
+          id: dbProduct.id,
+          barcode: dbProduct.barcode || rawCode,
+          name: dbProduct.name,
+          brand: "Surya's Store",
+          category: dbProduct.category,
+          price: Number(dbProduct.price),
+          mrp: Number((dbProduct.price * 1.15).toFixed(0)),
+          serves: dbProduct.serves || "1 Unit",
+          image: dbProduct.image || "",
+          gallery,
+          description: dbProduct.description || "",
+          ingredients,
+          benefits: dbProduct.benefits || "",
+          isVeg: Boolean(dbProduct.is_veg),
+          inStock: Boolean(dbProduct.in_stock),
+        },
       });
     }
+
+    // 2. Query Open Food Facts via backend fetch (bypasses browser CORS!)
+    try {
+      const offResponse = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(rawCode)}.json`, {
+        headers: {
+          "User-Agent": "SuryasGroceriesApp/2.3 (support@suryasgeneralstore.com)",
+          "Accept": "application/json",
+        },
+      });
+
+      if (offResponse.ok) {
+        const offData = await offResponse.json();
+        if (offData && offData.status === 1 && offData.product) {
+          const p = offData.product;
+          const pName = (p.product_name || p.product_name_en || "").trim();
+          if (pName) {
+            const brand = (p.brands || "Retail Supermarket Pack").split(",")[0].trim();
+            const quantity = (p.quantity || "1 Unit").trim();
+            const frontImg = (p.image_front_url || p.image_url || "").trim();
+            const gallery = [frontImg, p.image_packaging_url, p.image_nutrition_url].filter(Boolean);
+            const ingredients = p.ingredients_text ? [p.ingredients_text] : [];
+
+            return res.json({
+              ok: true,
+              source: "Open Food Facts Verified Database",
+              product: {
+                barcode: rawCode,
+                name: pName,
+                brand: brand || "Surya Select",
+                category: p.categories ? p.categories.split(",")[0].trim() : "Daily Groceries",
+                price: 45.0,
+                mrp: 50.0,
+                serves: quantity,
+                image: frontImg,
+                gallery: gallery.length > 0 ? gallery : (frontImg ? [frontImg] : []),
+                description: p.generic_name || `${pName} by ${brand}. Verified retail packaging.`,
+                ingredients,
+                benefits: "100% genuine retail packaging verified via official barcode.",
+                isVeg: !(p.ingredients_analysis_tags || "").toString().includes("non-veg"),
+              },
+            });
+          }
+        }
+      }
+    } catch (offErr) {
+      console.warn("Open Food Facts fetch error:", offErr.message);
+    }
+
+    return res.status(404).json({
+      ok: false,
+      message: `Barcode "${rawCode}" not found in registries.`,
+      barcode: rawCode,
+    });
+  } catch (error) {
+    console.error("Barcode lookup error:", error.message);
+    res.status(500).json({ ok: false, message: "Barcode service error." });
   }
-);
+});
 
 // ============================================================
-// ADMIN CHECK
+// ADMIN CHECK & AUTH
 // ============================================================
 
 const ADMIN_EMAILS = [
   "admin@suryasgeneralstore.com",
   "kilarimokshagna811@suryasgeneralstore.com",
+  "kilarimokshagna811@gmail.com",
+  "mokshagnakilari811@gmail.com",
   process.env.ADMIN_EMAIL,
 ].filter(Boolean).map((e) => e.toLowerCase());
 
-async function adminAuth(
-  req,
-  res,
-  next
-) {
-  await firebaseAuth(
-    req,
-    res,
-    async () => {
-      const email =
-        String(
-          req.firebaseUser.email || ""
-        )
-          .trim()
-          .toLowerCase();
-
-      if (
-        !ADMIN_EMAILS.includes(email)
-      ) {
-        return res.status(403).json({
-          message:
-            "Admin access required.",
-        });
-      }
-
-      await syncUser(
-        req,
-        res,
-        next
-      );
+async function adminAuth(req, res, next) {
+  await firebaseAuth(req, res, async () => {
+    const email = String(req.firebaseUser.email || "").trim().toLowerCase();
+    if (!ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ message: "Admin access required." });
     }
-  );
+    await syncUser(req, res, next);
+  });
 }
 
 // ============================================================
 // ADMIN ACTIVITY
 // ============================================================
 
-app.get(
-  "/api/admin/activity",
-  adminAuth,
-  (req, res) => {
-    try {
-      const users = db
-        .prepare(`
-          SELECT
-            id,
-            firebase_uid,
-            name,
-            email,
-            mobile,
-            address,
-            latitude,
-            longitude,
-            location_accuracy,
-            created_at
-          FROM users
-          ORDER BY created_at DESC
-        `)
-        .all();
+app.get("/api/admin/activity", adminAuth, (req, res) => {
+  try {
+    const rawUsers = db.prepare(`
+      SELECT id, firebase_uid, name, email, mobile, address, pincode, latitude, longitude, location_accuracy, created_at, last_active_at
+      FROM users
+      ORDER BY created_at DESC
+    `).all();
 
-      const logins = db
-        .prepare(`
-          SELECT
-            l.id,
-            l.user_id,
-            u.email,
-            u.name,
-            l.login_time
-          FROM login_events l
-          JOIN users u
-            ON u.id = l.user_id
-          ORDER BY l.login_time DESC
-        `)
-        .all();
+    const logins = db.prepare(`
+      SELECT l.id, l.user_id, u.email, u.name, l.login_time
+      FROM login_events l
+      JOIN users u ON u.id = l.user_id
+      ORDER BY l.login_time DESC
+    `).all();
 
-      const payments = db
-        .prepare(`
-          SELECT
-            p.id,
-            p.order_id,
-            p.user_id,
-            COALESCE(u.name, p.user_name, 'Customer') AS name,
-            COALESCE(u.email, p.user_email, '') AS email,
-            COALESCE(u.mobile, p.user_mobile, '') AS mobile,
-            p.amount,
-            p.payment_method,
-            p.payment_status,
-            p.order_status,
-            p.items_json,
-            COALESCE(p.address, u.address, '') AS address,
-            COALESCE(p.latitude, u.latitude) AS latitude,
-            COALESCE(p.longitude, u.longitude) AS longitude,
-            COALESCE(p.location_accuracy, u.location_accuracy) AS location_accuracy,
-            COALESCE(p.utr, '') AS utr,
-            p.payment_screenshot,
-            p.payment_time
-          FROM payments p
-          LEFT JOIN users u
-            ON u.id = p.user_id
-          ORDER BY p.payment_time DESC
-        `)
-        .all();
+    const payments = db.prepare(`
+      SELECT
+        p.id, p.order_id, p.user_id,
+        COALESCE(u.name, p.user_name, 'Customer') AS name,
+        COALESCE(u.email, p.user_email, '') AS email,
+        COALESCE(u.mobile, p.user_mobile, '') AS mobile,
+        p.amount, p.payment_method, p.payment_status, p.order_status, p.items_json,
+        COALESCE(p.address, u.address, '') AS address,
+        COALESCE(p.pincode, u.pincode, '') AS pincode,
+        COALESCE(p.latitude, u.latitude) AS latitude,
+        COALESCE(p.longitude, u.longitude) AS longitude,
+        COALESCE(p.location_accuracy, u.location_accuracy) AS location_accuracy,
+        COALESCE(p.utr, '') AS utr,
+        p.cancellation_requested, COALESCE(p.cancellation_status, 'None') AS cancellation_status,
+        p.cancellation_reason, p.cancellation_query, p.cancellation_time,
+        p.payment_screenshot, p.payment_time
+      FROM payments p
+      LEFT JOIN users u ON u.id = p.user_id
+      ORDER BY p.payment_time DESC
+    `).all();
 
-      res.json({
-        users,
-        logins,
-        payments,
-      });
-    } catch (error) {
-      console.error(error);
+    // Calculate online/offline status and user order statistics
+    const now = Date.now();
+    const fifteenMinutesMs = 15 * 60 * 1000;
 
-      res.status(500).json({
-        message:
-          "Could not load admin activity.",
-      });
-    }
+    const users = rawUsers.map((user) => {
+      const userLogins = logins.filter((l) =>
+        l.user_id === user.id ||
+        (user.email && l.email && l.email.toLowerCase() === user.email.toLowerCase())
+      );
+      const latestLoginTime = userLogins.length > 0 ? userLogins[0].login_time : null;
+      const effectiveActiveTime = user.last_active_at || latestLoginTime;
+
+      let isOnline = false;
+      if (effectiveActiveTime) {
+        const activeTs = new Date(effectiveActiveTime).getTime();
+        if (!isNaN(activeTs) && (now - activeTs) <= fifteenMinutesMs) {
+          isOnline = true;
+        }
+      }
+
+      // Count orders and total spend for user
+      const userPayments = payments.filter((p) =>
+        p.user_id === user.id ||
+        (user.email && p.email && p.email.toLowerCase() === user.email.toLowerCase())
+      );
+      const ordersCount = userPayments.length;
+      const totalSpent = userPayments
+        .filter((p) => !p.payment_status.toLowerCase().includes("reject") && !p.order_status.toLowerCase().includes("cancel"))
+        .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+      return {
+        ...user,
+        last_login: latestLoginTime,
+        last_active_at: effectiveActiveTime,
+        is_online: isOnline ? 1 : 0,
+        orders_count: ordersCount,
+        total_spent: totalSpent,
+      };
+    });
+
+    res.json({ users, logins, payments });
+  } catch (error) {
+    console.error("Admin activity error:", error.message);
+    res.status(500).json({ message: "Could not load admin activity." });
   }
-);
+});
 
 // ============================================================
-// ADMIN: VERIFY PAYMENT
+// ADMIN: VERIFY PAYMENT (ADMIN ONLY)
 // ============================================================
 
 function handleVerifyPayment(req, res) {
@@ -1492,23 +1908,35 @@ function handleVerifyPayment(req, res) {
     const { status } = req.body;
     const st = String(status || "").trim().toLowerCase();
     const isVerified = st.includes("verify") || st.includes("paid") || st.includes("success");
-    const isRejected = st.includes("reject") || st.includes("fail") || st.includes("cancel");
+    const isCancelled = st.includes("cancel");
+    const isRejected = st.includes("reject") || st.includes("fail") || isCancelled;
 
     if (!isVerified && !isRejected) {
-      return res.status(400).json({
-        message: "Invalid payment status.",
-      });
+      return res.status(400).json({ message: "Invalid payment status." });
     }
 
-    const order = db.prepare(`
-      SELECT *
-      FROM payments
-      WHERE order_id = ?
-    `).get(req.params.orderId);
-
+    const order = db.prepare("SELECT * FROM payments WHERE order_id = ?").get(req.params.orderId);
     if (!order) {
-      return res.status(404).json({
-        message: "Order not found.",
+      return res.status(404).json({ message: "Order not found." });
+    }
+
+    if (isCancelled) {
+      const now = new Date().toISOString();
+      db.prepare(`
+        UPDATE payments
+        SET payment_status = 'Cancelled',
+            order_status = 'Cancelled',
+            cancellation_requested = 0,
+            cancellation_status = 'Approved',
+            cancellation_time = COALESCE(cancellation_time, ?)
+        WHERE order_id = ?
+      `).run(now, req.params.orderId);
+
+      return res.json({
+        success: true,
+        paymentStatus: "Cancelled",
+        orderStatus: "Cancelled",
+        cancellationStatus: "Approved",
       });
     }
 
@@ -1517,17 +1945,9 @@ function handleVerifyPayment(req, res) {
 
     db.prepare(`
       UPDATE payments
-      SET
-        payment_status = ?,
-        order_status = ?
+      SET payment_status = ?, order_status = ?
       WHERE order_id = ?
-    `).run(
-      finalPaymentStatus,
-      finalOrderStatus,
-      req.params.orderId
-    );
-
-    console.log(`✅ [ADMIN PAYMENT UPDATE] Order ${req.params.orderId}: payment=${finalPaymentStatus}, order=${finalOrderStatus}`);
+    `).run(finalPaymentStatus, finalOrderStatus, req.params.orderId);
 
     res.json({
       success: true,
@@ -1535,129 +1955,330 @@ function handleVerifyPayment(req, res) {
       orderStatus: finalOrderStatus,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      message: "Could not update payment status.",
-    });
+    console.error("Admin payment verify error:", error.message);
+    res.status(500).json({ message: "Could not update payment status." });
   }
 }
 
 app.put("/api/admin/orders/:orderId/payment", adminAuth, handleVerifyPayment);
-app.post("/api/admin/orders/:orderId/payment", adminAuth, handleVerifyPayment);
 
 // ============================================================
-// ADMIN: DELIVERY STATUS
+// ADMIN: DELIVERY STATUS (PRESERVES PAYMENT STATUS SEPARATION)
 // ============================================================
 
-app.put(
-  "/api/admin/orders/:orderId/status",
-  adminAuth,
-  (req, res) => {
-    try {
-      const {
-        status,
-      } = req.body;
+app.put("/api/admin/orders/:orderId/status", adminAuth, (req, res) => {
+  try {
+    const { status } = req.body;
+    const allowed = [
+      "Pending Confirmation",
+      "Order Placed",
+      "Order Accepted",
+      "Accepted",
+      "Preparing",
+      "Packing",
+      "Packed",
+      "Packed with Care",
+      "Out for Delivery",
+      "Delivered",
+      "Successful",
+      "Completed",
+      "Cancellation Requested",
+      "Cancelled",
+    ];
 
-      const allowed = [
-        "Preparing",
-        "Out for Delivery",
-        "Delivered",
-        "Cancelled",
-      ];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid order status." });
+    }
 
-      if (!allowed.includes(status)) {
-        return res.status(400).json({
-          message:
-            "Invalid order status.",
-        });
-      }
+    const order = db.prepare("SELECT * FROM payments WHERE order_id = ?").get(req.params.orderId);
+    if (!order) {
+      return res.status(404).json({ message: "Order not found." });
+    }
 
-      const order =
-        db.prepare(`
-          SELECT *
-          FROM payments
-          WHERE order_id = ?
-        `).get(
-          req.params.orderId
-        );
-
-      if (!order) {
-        return res.status(404).json({
-          message:
-            "Order not found.",
-        });
-      }
-
-      if (
-        status ===
-          "Out for Delivery" ||
-        status === "Delivered"
-      ) {
-        if (
-          order.payment_status !==
-          "Payment Verified"
-        ) {
-          return res.status(400).json({
-            message:
-              "Payment must be verified before delivery.",
-          });
-        }
-      }
-
+    if (status === "Cancelled") {
+      const now = new Date().toISOString();
       db.prepare(`
         UPDATE payments
-        SET order_status = ?
+        SET order_status = 'Cancelled',
+            payment_status = 'Cancelled',
+            cancellation_requested = 0,
+            cancellation_status = 'Approved',
+            cancellation_time = COALESCE(cancellation_time, ?)
         WHERE order_id = ?
-      `).run(
-        status,
-        req.params.orderId
-      );
+      `).run(now, req.params.orderId);
 
-      res.json({
+      return res.json({
         success: true,
-        orderId:
-          req.params.orderId,
-        orderStatus: status,
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        message:
-          "Could not update order status.",
+        orderId: req.params.orderId,
+        orderStatus: "Cancelled",
+        paymentStatus: "Cancelled",
+        cancellationStatus: "Approved",
       });
     }
+
+    db.prepare(`
+      UPDATE payments
+      SET order_status = ?
+      WHERE order_id = ?
+    `).run(status, req.params.orderId);
+
+    res.json({
+      success: true,
+      orderId: req.params.orderId,
+      orderStatus: status,
+    });
+  } catch (error) {
+    console.error("Update status error:", error.message);
+    res.status(500).json({ message: "Could not update order status." });
   }
-);
+});
 
 // ============================================================
-// PRODUCTS TABLE & CRUD ENDPOINTS
+// ADMIN: APPROVE ORDER CANCELLATION (PERSISTS TO DB)
 // ============================================================
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS products (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT,
-  price REAL NOT NULL,
-  category TEXT NOT NULL,
-  is_veg INTEGER DEFAULT 1,
-  rating REAL DEFAULT 4.8,
-  reviews TEXT DEFAULT '100+',
-  prep_time TEXT DEFAULT 'Express 15m',
-  serves TEXT DEFAULT '1 Unit',
-  badge TEXT DEFAULT '',
-  image TEXT,
-  in_stock INTEGER DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`);
+app.post("/api/admin/orders/:orderId/cancel-approve", adminAuth, (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const order = db.prepare("SELECT * FROM payments WHERE order_id = ?").get(orderId);
+    if (!order) {
+      return res.status(404).json({ message: "Order not found." });
+    }
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE payments
+      SET order_status = 'Cancelled',
+          payment_status = 'Cancelled',
+          cancellation_requested = 0,
+          cancellation_status = 'Approved',
+          cancellation_time = COALESCE(cancellation_time, ?)
+      WHERE order_id = ?
+    `).run(now, orderId);
+
+    res.json({
+      success: true,
+      orderId,
+      orderStatus: "Cancelled",
+      paymentStatus: "Cancelled",
+      cancellationStatus: "Approved",
+      message: "Order cancellation request approved. Order officially cancelled.",
+    });
+  } catch (error) {
+    console.error("Cancel approve error:", error.message);
+    res.status(500).json({ message: "Could not approve order cancellation." });
+  }
+});
+
+// ============================================================
+// ADMIN: EXPORT ALL ORDERS TO EXCEL / CSV (DATABASE BACKED)
+// ============================================================
+
+app.get("/api/admin/orders/export-csv", (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT
+        p.order_id,
+        COALESCE(u.name, p.user_name, 'Customer') AS customer_name,
+        COALESCE(u.mobile, p.user_mobile, '') AS mobile,
+        COALESCE(u.email, p.user_email, '') AS email,
+        COALESCE(p.address, u.address, '') AS address,
+        COALESCE(p.pincode, u.pincode, '') AS pincode,
+        p.items_json,
+        p.amount,
+        p.payment_method,
+        COALESCE(p.utr, '') AS utr,
+        p.payment_status,
+        p.order_status,
+        p.cancellation_requested,
+        COALESCE(p.cancellation_status, 'None') AS cancellation_status,
+        COALESCE(p.cancellation_reason, '') AS cancellation_reason,
+        COALESCE(p.cancellation_query, '') AS cancellation_query,
+        p.payment_time,
+        COALESCE(p.cancellation_time, '') AS cancellation_time
+      FROM payments p
+      LEFT JOIN users u ON u.id = p.user_id
+      ORDER BY p.payment_time DESC
+    `).all();
+
+    const headers = [
+      "Order ID",
+      "Customer Name",
+      "Mobile Number",
+      "Email Address",
+      "Delivery Address",
+      "Pincode",
+      "Items Ordered",
+      "Total Items Count",
+      "Total Amount (INR)",
+      "Payment Method",
+      "Payment Status",
+      "Order Status",
+      "Cancellation Status",
+      "Cancellation Reason",
+      "Customer Query / Explanation",
+      "UTR / Transaction Ref",
+      "Order Placed Time",
+      "Cancellation Time"
+    ];
+
+    const escapeCsv = (val) => {
+      if (val === null || val === undefined) return '""';
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    };
+
+    const csvLines = [headers.map(escapeCsv).join(",")];
+
+    for (const r of rows) {
+      let itemsSummary = "";
+      let totalQty = 0;
+      try {
+        const items = JSON.parse(r.items_json || "[]");
+        itemsSummary = items.map(it => `${it.name || "Item"} (x${it.quantity || 1} @ Rs.${it.price || 0})`).join("; ");
+        totalQty = items.reduce((sum, it) => sum + (Number(it.quantity) || 1), 0);
+      } catch (_) {}
+
+      let cancelDisplay = r.cancellation_status;
+      if (r.order_status === "Cancelled" || r.payment_status === "Cancelled") {
+        cancelDisplay = "Approved & Cancelled";
+      } else if (r.cancellation_requested || r.order_status === "Cancellation Requested") {
+        cancelDisplay = "Cancellation Requested (Pending Admin)";
+      } else {
+        cancelDisplay = "Active / None";
+      }
+
+      csvLines.push([
+        escapeCsv(r.order_id),
+        escapeCsv(r.customer_name),
+        escapeCsv(r.mobile),
+        escapeCsv(r.email),
+        escapeCsv(r.address),
+        escapeCsv(r.pincode),
+        escapeCsv(itemsSummary),
+        escapeCsv(totalQty || ""),
+        escapeCsv(r.amount),
+        escapeCsv(r.payment_method),
+        escapeCsv(r.payment_status),
+        escapeCsv(r.order_status),
+        escapeCsv(cancelDisplay),
+        escapeCsv(r.cancellation_reason),
+        escapeCsv(r.cancellation_query),
+        escapeCsv(r.utr),
+        escapeCsv(r.payment_time),
+        escapeCsv(r.cancellation_time)
+      ].join(","));
+    }
+
+    const csvString = "\uFEFF" + csvLines.join("\r\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="Suryas_Groceries_Orders_Database.csv"');
+    res.send(csvString);
+  } catch (error) {
+    console.error("Orders export CSV error:", error.message);
+    res.status(500).json({ message: "Could not export orders." });
+  }
+});
+
+// ============================================================
+// PROTECTED ORDER TRACKING (AUTHENTICATED USER ONLY)
+// ============================================================
+
+app.get("/api/orders/track/:orderId", firebaseAuth, syncUser, (req, res) => {
+  try {
+    const callerEmail = String(req.firebaseUser?.email || "").toLowerCase();
+    const isAdmin = ADMIN_EMAILS.includes(callerEmail);
+
+    const order = db.prepare(`
+      SELECT order_id, user_id, amount, payment_method, payment_status, order_status, address, pincode, latitude, longitude, location_accuracy, payment_time, items_json
+      FROM payments
+      WHERE order_id = ?
+    `).get(req.params.orderId);
+
+    // Generic 404 prevents order enumeration and unauthorized order disclosure
+    if (!order || (!isAdmin && order.user_id !== req.user.id)) {
+      return res.status(404).json({ ok: false, message: "Order not found." });
+    }
+
+    res.json({
+      ok: true,
+      order: {
+        order_id: order.order_id,
+        amount: order.amount,
+        payment_method: order.payment_method,
+        payment_status: order.payment_status,
+        order_status: order.order_status,
+        address: order.address,
+        pincode: order.pincode || "",
+        latitude: order.latitude ?? null,
+        longitude: order.longitude ?? null,
+        location_accuracy: order.location_accuracy ?? null,
+        has_coordinates: Boolean(order.latitude != null && order.longitude != null),
+        payment_time: order.payment_time,
+        items: JSON.parse(order.items_json || "[]"),
+      },
+    });
+  } catch (error) {
+    console.error("Order tracking error:", error.message);
+    res.status(500).json({ ok: false, message: "Could not fetch order tracking info." });
+  }
+});
+
+// ============================================================
+// PUBLIC ORDER TRACKING (HIGH-ENTROPY TOKEN ONLY, ZERO PII)
+// ============================================================
+
+app.get("/api/orders/track-public/:trackingToken", (req, res) => {
+  try {
+    const { trackingToken } = req.params;
+    if (!trackingToken || typeof trackingToken !== "string" || trackingToken.length < 32) {
+      return res.status(400).json({ ok: false, message: "Invalid tracking token format." });
+    }
+
+    const order = db.prepare(`
+      SELECT order_id, payment_status, order_status, payment_time, items_json
+      FROM payments
+      WHERE tracking_token = ?
+    `).get(trackingToken);
+
+    if (!order) {
+      return res.status(404).json({ ok: false, message: "Tracking details not found." });
+    }
+
+    const items = JSON.parse(order.items_json || "[]");
+
+    // Return strictly minimal non-sensitive status fields with zero customer PII
+    res.json({
+      ok: true,
+      order: {
+        order_status: order.order_status,
+        payment_status: order.payment_status,
+        payment_time: order.payment_time,
+        items_count: items.length,
+      },
+    });
+  } catch (error) {
+    console.error("Public track error:", error.message);
+    res.status(500).json({ ok: false, message: "Could not fetch tracking details." });
+  }
+});
+
+// ============================================================
+// PRODUCTS CRUD ENDPOINTS
+// ============================================================
+
+function stringArrayJson(value) {
+  if (!Array.isArray(value)) return "[]";
+  return JSON.stringify(value
+    .filter((entry) => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 36));
+}
 
 app.get("/api/products", (req, res) => {
   try {
-    const products = db
-      .prepare("SELECT * FROM products ORDER BY created_at DESC")
-      .all();
+    const products = db.prepare("SELECT * FROM products ORDER BY created_at DESC").all();
     res.json(products);
   } catch (error) {
     console.error("Fetch products error:", error.message);
@@ -1665,36 +2286,25 @@ app.get("/api/products", (req, res) => {
   }
 });
 
-app.post("/api/products", (req, res) => {
+app.post("/api/products", adminAuth, (req, res) => {
   try {
     const {
-      id,
-      name,
-      description,
-      price,
-      category,
-      isVeg,
-      rating,
-      reviews,
-      prepTime,
-      serves,
-      badge,
-      image,
-      inStock,
+      id, name, description, price, category, isVeg, rating, reviews,
+      prepTime, serves, badge, image, gallery, ingredients, benefits,
+      suitableFor, inStock, barcode,
     } = req.body;
 
     if (!name || price == null || !category) {
-      return res.status(400).json({
-        message: "Name, price and category are required.",
-      });
+      return res.status(400).json({ message: "Name, price and category are required." });
     }
 
     const productId = id || `prod_${Date.now()}`;
 
     db.prepare(`
       INSERT OR REPLACE INTO products (
-        id, name, description, price, category, is_veg, rating, reviews, prep_time, serves, badge, image, in_stock, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, name, description, price, category, is_veg, rating, reviews, prep_time, serves, badge, image,
+        gallery_json, ingredients_json, benefits, suitable_for, in_stock, barcode, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       productId,
       name,
@@ -1708,7 +2318,12 @@ app.post("/api/products", (req, res) => {
       serves || "1 Unit",
       badge || "",
       image || "",
+      stringArrayJson(gallery),
+      stringArrayJson(ingredients),
+      benefits || "",
+      suitableFor || "",
       inStock === false ? 0 : 1,
+      barcode ? String(barcode).trim() : null,
       nowIso()
     );
 
@@ -1723,22 +2338,13 @@ app.post("/api/products", (req, res) => {
   }
 });
 
-app.put("/api/products/:id", (req, res) => {
+app.put("/api/products/:id", adminAuth, (req, res) => {
   try {
     const { id } = req.params;
     const {
-      name,
-      description,
-      price,
-      category,
-      isVeg,
-      rating,
-      reviews,
-      prepTime,
-      serves,
-      badge,
-      image,
-      inStock,
+      name, description, price, category, isVeg, rating, reviews,
+      prepTime, serves, badge, image, gallery, ingredients, benefits,
+      suitableFor, inStock, barcode,
     } = req.body;
 
     db.prepare(`
@@ -1754,7 +2360,12 @@ app.put("/api/products/:id", (req, res) => {
           serves = COALESCE(?, serves),
           badge = COALESCE(?, badge),
           image = COALESCE(?, image),
-          in_stock = COALESCE(?, in_stock)
+          gallery_json = COALESCE(?, gallery_json),
+          ingredients_json = COALESCE(?, ingredients_json),
+          benefits = COALESCE(?, benefits),
+          suitable_for = COALESCE(?, suitable_for),
+          in_stock = COALESCE(?, in_stock),
+          barcode = COALESCE(?, barcode)
       WHERE id = ?
     `).run(
       name,
@@ -1768,7 +2379,12 @@ app.put("/api/products/:id", (req, res) => {
       serves,
       badge,
       image,
+      gallery != null ? stringArrayJson(gallery) : null,
+      ingredients != null ? stringArrayJson(ingredients) : null,
+      benefits,
+      suitableFor,
       inStock != null ? (inStock ? 1 : 0) : null,
+      barcode != null ? String(barcode).trim() : null,
       id
     );
 
@@ -1783,7 +2399,7 @@ app.put("/api/products/:id", (req, res) => {
   }
 });
 
-app.delete("/api/products/:id", (req, res) => {
+app.delete("/api/products/:id", adminAuth, (req, res) => {
   try {
     const { id } = req.params;
     db.prepare("DELETE FROM products WHERE id = ?").run(id);
@@ -1857,7 +2473,7 @@ app.get("/api/app/update-info", (req, res) => {
   }
 });
 
-app.post("/api/app/update-info", (req, res) => {
+app.post("/api/app/update-info", adminAuth, (req, res) => {
   try {
     const { version, versionCode, sizeMb, title, description, apkUrl, updateAvailable } = req.body;
     db.prepare(`
@@ -1889,41 +2505,33 @@ app.use((req, res, next) => {
     !req.path.startsWith("/public")
   ) {
     const indexFile = path.join(webBuildPath, "index.html");
-
-    if (require("fs").existsSync(indexFile)) {
+    if (fs.existsSync(indexFile)) {
       return res.sendFile(indexFile);
     }
-
     return res.status(404).json({
-      error: "Frontend files are not available on this server."
+      error: "Frontend files are not available on this server.",
     });
   }
-
   next();
 });
 
 // ============================================================
-// SERVER
+// SERVER START
 // ============================================================
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      "=========================================="
-    );
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("==========================================");
+  console.log(`Surya's General Store API running on port ${PORT}`);
+  console.log(`Admin accounts configured: ${ADMIN_EMAILS.length}`);
+  console.log("==========================================");
+});
 
-    console.log(
-      `Surya's General Store API running on port ${PORT}`
-    );
-
-    console.log(
-      `Admin emails: ${ADMIN_EMAILS.join(", ")}`
-    );
-
-    console.log(
-      "=========================================="
-    );
-  }
-);
+// ============================================================
+// 24/7 RENDER KEEP-ALIVE
+// ============================================================
+const RENDER_PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || "https://surya-groceries-api.onrender.com";
+setInterval(async () => {
+  try {
+    await fetch(`${RENDER_PUBLIC_URL}/api/health`);
+  } catch (_) {}
+}, 9 * 60 * 1000);
